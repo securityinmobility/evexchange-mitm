@@ -6,10 +6,14 @@
 # the same pcap/log artifacts in captures/ at the end.
 #
 # Usage:
-#   ./run_live_demo.sh [tls|notls]
+#   ./run_live_demo.sh [tls|notls] [tamper]
 #   tls   (default) -- EVCC negotiates a real TLS/PnC session with a full
 #                       certificate chain.
 #   notls           -- EVCC negotiates a plaintext EIM/AC session.
+#   tamper          -- proxy tampers with EVSEMaxCurrent in
+#                       ChargeParameterDiscoveryRes (SECC->EVCC). Only takes
+#                       effect in notls mode -- see README "Content
+#                       tampering" section. Off by default.
 #
 # Ctrl+C at any point triggers the same cleanup as a normal finish: capture
 # streamers and tcpdump are stopped, and whatever was captured so far is
@@ -22,8 +26,23 @@ set -uo pipefail
 MODE="${1:-tls}"
 case "$MODE" in
     tls|notls) ;;
-    *) echo "Usage: $0 [tls|notls]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
 esac
+
+TAMPER_ARG="${2:-}"
+case "$TAMPER_ARG" in
+    ""|tamper) ;;
+    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
+esac
+PROXY_ENV_ARGS=()
+RUN_TAG="$MODE"
+if [ "$TAMPER_ARG" = "tamper" ]; then
+    PROXY_ENV_ARGS=(-e TAMPER=1)
+    RUN_TAG="${MODE}_tamper"
+    if [ "$MODE" = "tls" ]; then
+        echo "NOTE: tamper has no effect in tls mode -- use 'notls tamper' to see it." >&2
+    fi
+fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST_CAPDIR="/home/vasu/newtest001/captures"
@@ -54,9 +73,9 @@ cleanup() {
     # container) running indefinitely, since it has no more output to write
     # and so never gets SIGPIPE. Kill by matching the actual command line
     # instead, which is unique to this run via $TS.
-    pkill -f "tail -F -n \+1 /tmp/proxy_demo_${MODE}_${TS}.log" 2>/dev/null
-    pkill -f "tail -F -n \+1 /tmp/secc_demo_${MODE}_${TS}.log" 2>/dev/null
-    pkill -f "tail -F -n \+1 /tmp/evcc_demo_${MODE}_${TS}.log" 2>/dev/null
+    pkill -f "tail -F -n \+1 /tmp/proxy_demo_${RUN_TAG}_${TS}.log" 2>/dev/null
+    pkill -f "tail -F -n \+1 /tmp/secc_demo_${RUN_TAG}_${TS}.log" 2>/dev/null
+    pkill -f "tail -F -n \+1 /tmp/evcc_demo_${RUN_TAG}_${TS}.log" 2>/dev/null
 
     echo "--- Stopping captures cleanly (SIGINT, so pcap trailers are written) ---"
     docker exec Evil_EVSE_Evil_PEV pkill -INT -x tcpdump 2>/dev/null
@@ -65,16 +84,16 @@ cleanup() {
     sleep 1.5   # give tcpdump a moment to flush and close the file
 
     echo "--- Copying pcaps and logs out to the host ---"
-    docker cp "Evil_EVSE_Evil_PEV:/tmp/full_run_${MODE}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
-    docker cp "SECC:/tmp/secc_run_${MODE}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
-    docker cp "EVCC:/tmp/evcc_run_${MODE}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
-    docker cp "Evil_EVSE_Evil_PEV:/tmp/proxy_demo_${MODE}_${TS}.log" "$HOST_CAPDIR/" 2>&1
-    docker cp "SECC:/tmp/secc_demo_${MODE}_${TS}.log" "$HOST_CAPDIR/" 2>&1
-    docker cp "EVCC:/tmp/evcc_demo_${MODE}_${TS}.log" "$HOST_CAPDIR/" 2>&1
+    docker cp "Evil_EVSE_Evil_PEV:/tmp/full_run_${RUN_TAG}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
+    docker cp "SECC:/tmp/secc_run_${RUN_TAG}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
+    docker cp "EVCC:/tmp/evcc_run_${RUN_TAG}_${TS}.pcap" "$HOST_CAPDIR/" 2>&1
+    docker cp "Evil_EVSE_Evil_PEV:/tmp/proxy_demo_${RUN_TAG}_${TS}.log" "$HOST_CAPDIR/" 2>&1
+    docker cp "SECC:/tmp/secc_demo_${RUN_TAG}_${TS}.log" "$HOST_CAPDIR/" 2>&1
+    docker cp "EVCC:/tmp/evcc_demo_${RUN_TAG}_${TS}.log" "$HOST_CAPDIR/" 2>&1
 
     echo
     echo "=== Done. Captures for this run: ==="
-    ls -la "$HOST_CAPDIR"/*"${MODE}_${TS}"* 2>/dev/null
+    ls -la "$HOST_CAPDIR"/*"${RUN_TAG}_${TS}"* 2>/dev/null
 
     # Unlike EXIT, bash's INT/TERM traps do NOT stop the script after the
     # handler returns -- without this, a Ctrl+C here would run cleanup and
@@ -85,7 +104,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "=== Live run $TS (mode: $MODE) ==="
+echo "=== Live run $TS (mode: $MODE${TAMPER_ARG:+, $TAMPER_ARG}) ==="
 
 echo "--- Ensuring containers are up ---"
 docker start EVCC SECC Evil_EVSE_Evil_PEV >/dev/null
@@ -107,37 +126,37 @@ docker exec EVCC pkill -f "mod_acccs/PEV.py" 2>/dev/null
 sleep 1
 
 echo "--- Starting packet captures ---"
-docker exec -d Evil_EVSE_Evil_PEV tcpdump -i any -w "/tmp/full_run_${MODE}_${TS}.pcap"
-docker exec -d SECC tcpdump -i any -w "/tmp/secc_run_${MODE}_${TS}.pcap"
-docker exec -d EVCC tcpdump -i any -w "/tmp/evcc_run_${MODE}_${TS}.pcap"
+docker exec -d Evil_EVSE_Evil_PEV tcpdump -i any -w "/tmp/full_run_${RUN_TAG}_${TS}.pcap"
+docker exec -d SECC tcpdump -i any -w "/tmp/secc_run_${RUN_TAG}_${TS}.pcap"
+docker exec -d EVCC tcpdump -i any -w "/tmp/evcc_run_${RUN_TAG}_${TS}.pcap"
 sleep 1.5
 
 echo "--- Attaching live output streams (labeled, color-coded) ---"
 # Pre-create the log files so `tail -F` can attach before the processes
 # that write them even start -- -F (not -f) retries/re-opens across the
 # truncate that happens when the process's own `> file` redirection opens.
-docker exec Evil_EVSE_Evil_PEV touch "/tmp/proxy_demo_${MODE}_${TS}.log"
-docker exec SECC touch "/tmp/secc_demo_${MODE}_${TS}.log"
-docker exec EVCC touch "/tmp/evcc_demo_${MODE}_${TS}.log"
+docker exec Evil_EVSE_Evil_PEV touch "/tmp/proxy_demo_${RUN_TAG}_${TS}.log"
+docker exec SECC touch "/tmp/secc_demo_${RUN_TAG}_${TS}.log"
+docker exec EVCC touch "/tmp/evcc_demo_${RUN_TAG}_${TS}.log"
 
-docker exec Evil_EVSE_Evil_PEV tail -F -n +1 "/tmp/proxy_demo_${MODE}_${TS}.log" 2>/dev/null \
+docker exec Evil_EVSE_Evil_PEV tail -F -n +1 "/tmp/proxy_demo_${RUN_TAG}_${TS}.log" 2>/dev/null \
     | sed -u "s/^/${C_PROXY}[PROXY]${C_RESET} /" &
-docker exec SECC tail -F -n +1 "/tmp/secc_demo_${MODE}_${TS}.log" 2>/dev/null \
+docker exec SECC tail -F -n +1 "/tmp/secc_demo_${RUN_TAG}_${TS}.log" 2>/dev/null \
     | sed -u "s/^/${C_SECC}[SECC]${C_RESET}  /" &
-docker exec EVCC tail -F -n +1 "/tmp/evcc_demo_${MODE}_${TS}.log" 2>/dev/null \
+docker exec EVCC tail -F -n +1 "/tmp/evcc_demo_${RUN_TAG}_${TS}.log" 2>/dev/null \
     | sed -u "s/^/${C_EVCC}[EVCC]${C_RESET}  /" &
 sleep 0.5
 
 echo "--- Starting proxy (SDP/TCP relay) ---"
-docker exec -d Evil_EVSE_Evil_PEV bash -c "cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex > /tmp/proxy_demo_${MODE}_${TS}.log 2>&1"
+docker exec -d "${PROXY_ENV_ARGS[@]}" Evil_EVSE_Evil_PEV bash -c "cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex > /tmp/proxy_demo_${RUN_TAG}_${TS}.log 2>&1"
 sleep 2
 
 echo "--- Starting SECC (SLAC then HLC) ---"
-docker exec -d SECC bash -c "/usr/src/app/secc_run_full.sh > /tmp/secc_demo_${MODE}_${TS}.log 2>&1"
+docker exec -d SECC bash -c "/usr/src/app/secc_run_full.sh > /tmp/secc_demo_${RUN_TAG}_${TS}.log 2>&1"
 sleep 2
 
 echo "--- Starting EVCC (SLAC then HLC, mode=$MODE) ---"
-docker exec -d -e EVCC_MODE="$MODE" EVCC bash -c "/usr/src/app/evcc_run_full.sh > /tmp/evcc_demo_${MODE}_${TS}.log 2>&1"
+docker exec -d -e EVCC_MODE="$MODE" EVCC bash -c "/usr/src/app/evcc_run_full.sh > /tmp/evcc_demo_${RUN_TAG}_${TS}.log 2>&1"
 echo "=== Live output below (Ctrl+C to stop and save captures at any point) ==="
 echo
 

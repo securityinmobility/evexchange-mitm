@@ -176,8 +176,9 @@ The easiest path is the orchestrator, which starts everything, captures
 packets, and copies the results back to the host:
 
 ```bash
-./scripts/run_full_demo.sh        # TLS/PnC session (default)
-./scripts/run_full_demo.sh notls  # plaintext EIM/AC session — see below
+./scripts/run_full_demo.sh                # TLS/PnC session (default)
+./scripts/run_full_demo.sh notls           # plaintext EIM/AC session — see below
+./scripts/run_full_demo.sh notls tamper    # plaintext + live content tampering — see "Content tampering"
 ```
 
 This starts all three containers, ensures `slac_net` exists and `EVCC`/`SECC`
@@ -334,6 +335,74 @@ fresh from the `proxy-proxy` image (not just stopped/started), the
 short-lived certs baked into the image come back and `regen_certs.sh` needs
 to be re-run.
 
+## Content tampering
+
+Up to this point the proxy only *observes* the session — every byte it
+relays is exactly what SECC or EVCC sent. `TAMPER=1` (or `--tamper` on
+`proxy01.py` directly) makes it actually alter content in flight, to
+demonstrate the MITM can tamper with a session, not just watch it:
+
+```bash
+./scripts/run_full_demo.sh notls tamper
+./scripts/run_live_demo.sh notls tamper
+```
+
+**What it tampers with, and why it's safety-relevant**: `ChargeParameterDiscoveryRes`
+(SECC → EVCC) carries `AC_EVSEChargeParameter.EVSEMaxCurrent` — the charger
+telling the car how much current the physical hookup can safely supply. The
+proxy decodes this message as it passes through, changes
+`EVSEMaxCurrent.Value` from the demo EVSE's real `32` (Amps) to `63`, and
+re-encodes it before forwarding — a real EVSE overstating its own supply
+capacity in transit, which is a genuine electrical-safety-relevant
+falsification (as opposed to e.g. tampering with pricing or a status
+string), and it's the SECC→EVCC direction rather than the EVCC→SECC
+direction the old `virtual-charging-station/Proxy/mod_proxy.py`'s
+`EVMaxVoltage` example used. When it fires, the proxy prints a loud, `grep`-able
+line regardless of `--debug`/`--show-hex`:
+
+```
+[TAMPER] EVSEMaxCurrent: 32A -> 63A (ChargeParameterDiscoveryRes, SECC→EVCC)
+```
+
+**Only takes effect in `notls` mode.** The proxy relays TLS as an opaque
+encrypted byte stream (see "The proxy fix" below) without terminating it
+itself — tampering TLS-protected content would need a full TLS-interception
+MITM (present the proxy's own certificate to EVCC, open a separate TLS
+connection to SECC, decrypt/modify/re-encrypt in the middle), which this
+does not implement. `tls tamper` runs without error but has no effect
+(a `NOTE:` line says so up front); use `notls tamper` to actually see it.
+
+**Verified: EVCC accepts the tampered value with no validation, but this
+particular reference simulator doesn't act on it.** Confirmed live, both
+ends:
+- EVCC's own decoded-message log shows it received and logged
+  `"EVSEMaxCurrent":{"Multiplier":0,"Unit":"A","Value":63}` verbatim — the
+  tampered value, not the real `32` — and proceeded straight into
+  `PowerDelivery`/`ChargingStatus` with no rejection, clamping, or warning.
+  This is the actual point of the demo: the EV trusted a falsified claim
+  about the charger's electrical capacity with zero pushback.
+- However, `grep -rn EVSEMaxCurrent iso15118/evcc/` inside the EVCC
+  container returns nothing: this EcoG reference simulator (`SimEVController`)
+  never reads `EVSEMaxCurrent` anywhere in its own logic. Its charging
+  profile (`PowerDeliveryReq.ChargingProfile`) is instead driven by
+  `PMaxSchedule` (a power/Watts figure, part of the same
+  `ChargeParameterDiscoveryRes` but a different field, left untampered), so
+  the EV's own requested profile doesn't visibly change in this specific
+  code path. A real vehicle's onboard charger hardware would be expected to
+  treat `EVSEMaxCurrent` as a hard current ceiling independent of the power
+  schedule — this reference simulator just doesn't model that, so the
+  "did it get used" question splits into "accepted, yes" / "acted on
+  *this specific way*, not observably, in this simulator." Reported
+  honestly rather than claiming a dramatic behavioral change that isn't
+  actually there.
+
+An example capture is included in [`examples/`](./examples):
+`full_run_tamper.pcap`, `proxy_demo_tamper.log` (shows the `[TAMPER]` line),
+and `evcc_demo_tamper.log` (shows EVCC decoding the tampered `63A` value).
+
+While fixing this, `proxy01.py`'s own EXI codec turned out to be broken:
+see the next section.
+
 ## The proxy fix (`proxy01.py`)
 
 The version of `proxy01.py` in this repo fixes a framing bug in the original:
@@ -369,6 +438,21 @@ The same class of bug independently hit `secc_run_full.sh`/`evcc_run_full.sh`
 and got the same fix, applied per-script via a small `resolve_iface()`
 shell function — see [Topology](#topology) for the details and how it was
 actually reproduced.
+
+It also fixes a third, more basic bug found while building the
+[content tampering](#content-tampering) feature: `proxy01.py`'s own
+`ExificientEXICodec` class only implemented `decode()`, not `encode()` or
+`get_version()` — but it subclassed `IEXICodec`, an abstract base class that
+requires all three. Instantiating it (`--debug`, or anything else that
+needed the codec) raised `TypeError: Can't instantiate abstract class
+ExificientEXICodec with abstract methods encode, get_version` immediately,
+silently killing the session — meaning `--debug` had never actually worked.
+Fixed by dropping the partial reimplementation entirely and reusing the
+real, complete codec the SECC/EVCC processes themselves already use
+(`iso15118.shared.exificient_exi_codec.ExificientEXICodec`), wrapped in a
+thin async shim (`ProxyCodec`). This also guarantees `encode()`'s output
+stays schema-compatible with whatever this iso15118 version actually
+expects, which a hand-rolled encoder would risk getting subtly wrong.
 
 ## Repo layout
 
