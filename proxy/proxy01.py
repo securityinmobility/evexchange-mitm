@@ -38,9 +38,26 @@ SDP_MULTICAST_GROUP = 'ff02::1'
 SDP_SERVER_PORT = 15118
 proxy_port = 55000
 
-scope_id_pattern = re.compile(r'^(\d+):')
-ipv6_pattern = re.compile(r'inet6 ([\da-fA-F:]+)\/\d+ scope link')
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+# --------------------------------------------------------------------
+# SECC/EVCC network identity (subnet-based, not interface-list-order-based)
+# --------------------------------------------------------------------
+# These are the subnets proxy_net1 (SECC-facing) and proxy_net2 (EVCC-facing)
+# are created with (see run_full_demo.sh / README "One-time setup"). Docker
+# does not guarantee that eth0/eth1 map to proxy_net1/proxy_net2 in a stable
+# order across container restarts or `docker network connect` calls, so we
+# identify each interface by which of these subnets it's actually on,
+# instead of assuming "first interface = SECC, second = EVCC".
+SECC_NET_V4 = ipaddress.ip_network("172.20.0.0/16")
+SECC_NET_V6 = ipaddress.ip_network("2001:db8:1::/64")
+EVCC_NET_V4 = ipaddress.ip_network("172.19.0.0/16")
+EVCC_NET_V6 = ipaddress.ip_network("2001:db8:2::/64")
+
+iface_header_pattern = re.compile(r'^(\d+):\s+(\S+?)(?:@\S+)?:')
+inet4_pattern = re.compile(r'inet (\d+\.\d+\.\d+\.\d+)/\d+')
+inet6_global_pattern = re.compile(r'inet6 ([\da-fA-F:]+)/\d+ scope global')
+inet6_link_pattern = re.compile(r'inet6 ([\da-fA-F:]+)/\d+ scope link')
 
 # --------------------------------------------------------------------
 # EXI Codec Wrapper
@@ -72,20 +89,68 @@ class ExificientEXICodec(IEXICodec):
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
-async def get_ipv6_addresses_and_scope_ids():
+async def discover_secc_evcc_interfaces():
+    """
+    Identify which local interface faces SECC's network (proxy_net1) and
+    which faces EVCC's (proxy_net2) by matching each interface's actual
+    assigned subnet (IPv4 and/or global IPv6) against the known
+    SECC_NET_*/EVCC_NET_* ranges. This is self-correcting regardless of
+    which order the interfaces were connected in -- it does not rely on
+    `ip a` listing order at all.
+
+    Returns {"secc": (link_local_addr, scope_id), "evcc": (link_local_addr, scope_id)},
+    with a role missing if no interface matched its subnet.
+    """
     result = await asyncio.create_subprocess_shell('ip a', stdout=asyncio.subprocess.PIPE)
     stdout, _ = await result.communicate()
     lines = stdout.decode().splitlines()
-    scope_ids, current_scope_id = {}, None
+
+    interfaces = {}  # scope_id -> {"v4": str, "v6_global": str, "v6_link": str}
+    current_scope_id = None
     for line in lines:
-        scope_id_match = scope_id_pattern.match(line)
-        if scope_id_match:
-            current_scope_id = scope_id_match.group(1)
-        ipv6_match = ipv6_pattern.search(line)
-        if ipv6_match and current_scope_id:
-            ipv6_address = ipv6_match.group(1)
-            scope_ids[ipv6_address] = int(current_scope_id)
-    return scope_ids
+        header_match = iface_header_pattern.match(line)
+        if header_match:
+            current_scope_id = int(header_match.group(1))
+            interfaces.setdefault(current_scope_id, {})
+            continue
+        if current_scope_id is None:
+            continue
+        v4_match = inet4_pattern.search(line)
+        if v4_match:
+            interfaces[current_scope_id]["v4"] = v4_match.group(1)
+        v6_global_match = inet6_global_pattern.search(line)
+        if v6_global_match:
+            interfaces[current_scope_id]["v6_global"] = v6_global_match.group(1)
+        v6_link_match = inet6_link_pattern.search(line)
+        if v6_link_match:
+            interfaces[current_scope_id]["v6_link"] = v6_link_match.group(1)
+
+    def identify_role(addrs):
+        v4 = addrs.get("v4")
+        v6g = addrs.get("v6_global")
+        try:
+            if v4 and ipaddress.ip_address(v4) in SECC_NET_V4:
+                return "secc"
+            if v4 and ipaddress.ip_address(v4) in EVCC_NET_V4:
+                return "evcc"
+            if v6g and ipaddress.ip_address(v6g) in SECC_NET_V6:
+                return "secc"
+            if v6g and ipaddress.ip_address(v6g) in EVCC_NET_V6:
+                return "evcc"
+        except ValueError:
+            pass
+        return None
+
+    roles = {}
+    for scope_id, addrs in interfaces.items():
+        link = addrs.get("v6_link")
+        if not link:
+            continue
+        role = identify_role(addrs)
+        if role:
+            roles[role] = (link, scope_id)
+
+    return roles
 
 def parse_response(hex_data):
     data = bytes.fromhex(hex_data)
@@ -125,6 +190,13 @@ async def udp_listen_and_print(iface, start_event, local_ips):
         print(f"\nReceived SDP Request from {client_addr}")
         udp_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+        # Pin the outgoing multicast interface to the SECC-facing one
+        # (identified by subnet, see discover_secc_evcc_interfaces). Without
+        # this, the kernel picks the interface for ff02::1 based on the
+        # default route, which -- like interface list order -- Docker does
+        # not guarantee stays pointed at proxy_net1 across reconnects.
+        if secc_scope_id is not None:
+            udp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, secc_scope_id)
         udp_sock.sendto(data, (SDP_MULTICAST_GROUP, SDP_SERVER_PORT))
 
         udp_sock.settimeout(3)
@@ -252,25 +324,28 @@ async def start_tcp_proxy(start_event):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    ipv6_scope_ids = loop.run_until_complete(get_ipv6_addresses_and_scope_ids())
+    roles = loop.run_until_complete(discover_secc_evcc_interfaces())
 
-    print("\nSECC and EVCC network interfaces:")
+    print("\nSECC and EVCC network interfaces (identified by subnet, not list order):")
     local_ips = set()
-    for ipv6, scope in ipv6_scope_ids.items():
-        print(f"{ipv6} -> {scope}")
-        local_ips.add(ipv6)
+    for role, (addr, scope) in roles.items():
+        print(f"  {role}: {addr} -> scope {scope}")
+        local_ips.add(addr)
 
-    if len(ipv6_scope_ids) > 1:
-        evcc_ip = list(ipv6_scope_ids.keys())[1]
-        evcc_scope_id = ipv6_scope_ids[evcc_ip]
+    if "secc" in roles:
+        secc_ip, secc_scope_id = roles["secc"]
+    else:
+        secc_ip, secc_scope_id = None, None
+        print(f"WARNING: no interface found on the SECC subnet "
+              f"({SECC_NET_V4} / {SECC_NET_V6}) -- SDP relay to SECC will fail.")
+
+    if "evcc" in roles:
+        evcc_ip, evcc_scope_id = roles["evcc"]
     else:
         evcc_ip, evcc_scope_id = None, None
-
-    if len(ipv6_scope_ids) > 0:
-        secc_ip = list(ipv6_scope_ids.keys())[0]
-        secc_scope_id = ipv6_scope_ids[secc_ip]
-    else:
-        secc_scope_id = None
+        print(f"WARNING: no interface found on the EVCC subnet "
+              f"({EVCC_NET_V4} / {EVCC_NET_V6}) -- EVCC will never get a "
+              f"usable SDP response.")
 
     start_event = asyncio.Event()
     udp_task = loop.create_task(udp_listen_and_print("eth0", start_event, local_ips))

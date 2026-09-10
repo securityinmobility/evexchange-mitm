@@ -75,14 +75,23 @@ Two independent networks, on two different interfaces of `EVCC` and `SECC`:
   crashes immediately with `IndexError: list index out of range`).
 - At the HLC layer, `EVCC` and `SECC` are **still never on the same
   network** — they can only reach each other through the proxy, which is the
-  only container on both `proxy_net1` and `proxy_net2`. `proxy01.py`
-  auto-discovers its own addresses via `ip a` and assumes its *first*
-  interface (`eth0`) faces SECC's network and its *second* (`eth1`) faces
-  EVCC's — so container placement matters:
+  only container on both `proxy_net1` and `proxy_net2`:
   - `SECC` → `proxy_net1` (eth0) + `slac_net` (eth1)
   - `EVCC` → `proxy_net2` (eth0) + `slac_net` (eth1)
-  - `Evil_EVSE_Evil_PEV` (the proxy) → `proxy_net1` (eth0) + `proxy_net2`
-    (eth1), not on `slac_net` at all
+  - `Evil_EVSE_Evil_PEV` (the proxy) → `proxy_net1` + `proxy_net2`, not on
+    `slac_net` at all
+- `proxy01.py` identifies which of its own interfaces faces SECC vs. EVCC by
+  matching each interface's assigned subnet against the known `proxy_net1`
+  (`172.20.0.0/16` / `2001:db8:1::/64`) and `proxy_net2`
+  (`172.19.0.0/16` / `2001:db8:2::/64`) ranges — **not** by assuming its
+  first (`eth0`) vs. second (`eth1`) interface. Docker does not guarantee
+  `eth0`/`eth1` map to `proxy_net1`/`proxy_net2` in a stable order across
+  container restarts or `docker network connect` calls (verified: it can
+  and does flip), so subnet identity is what actually matters, not
+  interface list position or connect order. Same reasoning applies to the
+  SDP multicast relay: the outgoing interface for that is explicitly pinned
+  to the identified SECC-facing interface (`IPV6_MULTICAST_IF`), rather than
+  left to the kernel's default-route interface pick.
 
 `secc_run_full.sh`/`evcc_run_full.sh` point AcCCS's SLAC step at `eth1`
 (`slac_net`) and the HLC step stays on `eth0` (`NETWORK_INTERFACE` defaults
@@ -260,6 +269,19 @@ inverse version, 2B payload type, 4B payload length), parse the real payload
 length, then read exactly that many more bytes — so SECC always receives one
 complete V2GTP message per write. TLS framing is left to the TLS layer
 itself, same as before.
+
+It also fixes an interface-identity bug: the original discovered its own
+addresses via `ip a` and assumed the first-listed interface faced SECC and
+the second faced EVCC. That assumption breaks silently whenever Docker
+attaches/reconnects the two networks in the other order (which it does not
+guarantee against — confirmed by deliberately reconnecting `proxy_net1`/
+`proxy_net2` in the wrong order and watching the SDP relay time out with
+`No SDP response from SECC`). Fixed version identifies each interface by
+matching its actual subnet against the known `proxy_net1`/`proxy_net2`
+ranges (`discover_secc_evcc_interfaces()`), and pins the outgoing SDP
+multicast relay to the identified SECC-facing interface
+(`IPV6_MULTICAST_IF`) instead of trusting the kernel's default-route pick —
+so it self-corrects regardless of connect order.
 
 ## Repo layout
 
