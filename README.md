@@ -140,7 +140,8 @@ The easiest path is the orchestrator, which starts everything, captures
 packets, and copies the results back to the host:
 
 ```bash
-./scripts/run_full_demo.sh
+./scripts/run_full_demo.sh        # TLS/PnC session (default)
+./scripts/run_full_demo.sh notls  # plaintext EIM/AC session — see below
 ```
 
 This starts all three containers, ensures `slac_net` exists and `EVCC`/`SECC`
@@ -156,12 +157,12 @@ repeated runs never clobber each other:
 
 ```
 captures/
-  full_run_<ts>.pcap    # proxy's view — both HLC relay legs, the authoritative HLC capture
-  secc_run_<ts>.pcap    # SECC's own HLC leg + the real SLAC handshake on eth1
-  evcc_run_<ts>.pcap    # EVCC's own HLC leg + the real SLAC handshake on eth1
-  proxy_demo_<ts>.log   # proxy01.py's relay/decode log
-  secc_demo_<ts>.log    # SECC-side SLAC + HLC stdout
-  evcc_demo_<ts>.log    # EVCC-side SLAC + HLC stdout
+  full_run_<mode>_<ts>.pcap    # proxy's view — both HLC relay legs, the authoritative HLC capture
+  secc_run_<mode>_<ts>.pcap    # SECC's own HLC leg + the real SLAC handshake on eth1
+  evcc_run_<mode>_<ts>.pcap    # EVCC's own HLC leg + the real SLAC handshake on eth1
+  proxy_demo_<mode>_<ts>.log   # proxy01.py's relay/decode log
+  secc_demo_<mode>_<ts>.log    # SECC-side SLAC + HLC stdout
+  evcc_demo_<mode>_<ts>.log    # EVCC-side SLAC + HLC stdout
 ```
 
 Or run each step manually, one shell per container:
@@ -182,14 +183,39 @@ docker exec -it EVCC bash
 
 ### TLS / Plug & Charge vs. plaintext
 
-`evcc_run_full.sh` runs with the PnC config
-(`evcc_config_pnc_ac.json`, `useTls: true`) by default, so the session
-negotiates a real TLS handshake with a full cert chain
-(`CPOSubCA2 → SECCCert`, `CPOSubCA2 → CPOSubCA1 → V2GRootCA`). SECC needs no
-corresponding change — it already advertises both `EIM` and `PNC` auth modes
-and follows whatever the EVCC's SDP request asks for. To run the plaintext
-EIM/AC session instead, drop the `config=...` argument from `make run-evcc`
-in `evcc_run_full.sh` (or point it at `evcc_config_eim_ac.json`).
+The orchestrator takes a mode argument, so the two demos you actually run are:
+
+```bash
+./scripts/run_full_demo.sh tls      # (or no arg — default) real TLS/PnC session
+./scripts/run_full_demo.sh notls    # plaintext EIM/AC session
+```
+
+This selects `EVCC_CONFIG_PATH` on the EVCC side only — `evcc_run_full.sh`
+reads an `EVCC_MODE` env var (`tls` by default) and picks
+`evcc_config_pnc_ac.json` (`useTls: true`) or `evcc_config_eim_ac.json`
+(`useTls: false`) accordingly; `run_full_demo.sh` passes the mode through via
+`docker exec -e EVCC_MODE=... EVCC ...`. `SECC` needs no corresponding
+change — it already advertises both `EIM` and `PNC` auth modes and follows
+whatever the EVCC's SDP request asks for, so `secc_run_full.sh` is identical
+in both modes. The SLAC step (now on `slac_net`, see [Topology](#topology))
+is also identical in both modes.
+
+`tls` mode negotiates a real TLS handshake with a full cert chain
+(`CPOSubCA2 → SECCCert`, `CPOSubCA2 → CPOSubCA1 → V2GRootCA`). `notls` mode
+negotiates a plaintext EXI session and completes the same state sequence
+(`SupportedAppProtocol` → `SessionSetup` → `ServiceDiscovery` →
+`PaymentServiceSelection` → `Authorization` → `ChargeParameterDiscovery` →
+`PowerDelivery` → `ChargingStatus` → `SessionStop`) with no TLS records at
+all. Capture filenames from `run_full_demo.sh` are tagged with the mode,
+e.g. `full_run_tls_<ts>.pcap` / `full_run_notls_<ts>.pcap`, so results from
+both never collide.
+
+If you're driving the containers manually instead of through the
+orchestrator, set `EVCC_MODE=notls` before calling `evcc_run_full.sh`:
+
+```bash
+docker exec -it -e EVCC_MODE=notls EVCC bash -c /usr/src/app/evcc_run_full.sh
+```
 
 Example captures from a single, real run are included in
 [`examples/`](./examples):
