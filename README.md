@@ -122,6 +122,26 @@ cd virtual-charging-station/Proxy
 docker compose build --no-cache   # -> image `proxy-proxy`
 ```
 
+### Tested versions 📌
+
+`Dockerfile.proxytest` clones all four dependencies below unpinned by
+default (whatever's HEAD at build time), which is exactly what let this
+setup silently drift out of sync with itself once before. Pin each `git
+clone` in `Dockerfile.proxytest` to these commits — they're what every
+result in this README (`examples/`, the live-demo output, the SLAC/HLC
+captures) was actually produced against:
+
+| Dependency | Pinned at | Last verified working |
+|---|---|---|
+| [`EcoG-io/iso15118`](https://github.com/EcoG-io/iso15118) | [`b256f9b`](https://github.com/EcoG-io/iso15118/commit/b256f9b379d3c0acbea24258c4a184f5264950a2) (2025-10-02) | 2026-09-10 |
+| [`vvvasu/mod_acccs`](https://github.com/vvvasu/mod_acccs) | [`fa1d08e`](https://github.com/vvvasu/mod_acccs/commit/fa1d08ea4c679cb37562c26a8775b0c86aab0d99) (2025-10-29) | 2026-09-10 |
+| [`JakeMG-INL/HomePlugPWN`](https://github.com/JakeMG-INL/HomePlugPWN) | [`ff840e7`](https://github.com/JakeMG-INL/HomePlugPWN/commit/ff840e707b0c54e06b1c836ed47112daffefd200) (2025-05-01) | 2026-09-10 |
+| [`JakeMG-INL/V2GInjector`](https://github.com/JakeMG-INL/V2GInjector) | [`1823d05`](https://github.com/JakeMG-INL/V2GInjector/commit/1823d055fe72f2613e3052736e3fc9071cba5f9f) (2024-01-10) | 2026-09-10 |
+
+If you bump any of these, re-run the full `run_full_demo.sh`/`run_live_demo.sh`
+flow (both `tls` and `notls`) before updating this table — a pin that's gone
+stale without re-verification is barely better than no pin.
+
 ## One-time setup
 
 ```bash
