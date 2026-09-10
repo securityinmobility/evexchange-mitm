@@ -20,6 +20,14 @@ echo "=== Run $TS ==="
 echo "--- Ensuring containers are up ---"
 docker start EVCC SECC Evil_EVSE_Evil_PEV >/dev/null
 
+echo "--- Ensuring slac_net exists and EVCC/SECC are attached to it ---"
+# slac_net is a dedicated L2 segment shared ONLY by EVCC and SECC (not the
+# proxy), for the real SLAC handshake -- eth0 stays on proxy_net1/proxy_net2
+# for the isolated HLC MITM relay, untouched. Idempotent: safe to re-run.
+docker network create --ipv6 --subnet 2001:db8:3::/64 slac_net >/dev/null 2>&1 || true
+docker network connect slac_net EVCC >/dev/null 2>&1 || true
+docker network connect slac_net SECC >/dev/null 2>&1 || true
+
 echo "--- Cleaning up any leftover processes from a previous run ---"
 docker exec Evil_EVSE_Evil_PEV pkill -x tcpdump 2>/dev/null
 docker exec Evil_EVSE_Evil_PEV pkill -f proxy01.py 2>/dev/null
