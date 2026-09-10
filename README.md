@@ -53,13 +53,13 @@ plaintext sessions via `--debug`.
 Two independent networks, on two different interfaces of `EVCC` and `SECC`:
 
 ```
-                         slac_net (eth1, shared L2 segment for real SLAC)
+                         slac_net (shared L2 segment for real SLAC)
               ┌──────────────────────────────────────────────────────┐
               │                                                      │
    EVCC container                                             SECC container
  (EcoG iso15118 EVCC,                                       (EcoG iso15118 SECC,
    AcCCS PEV role)                                             AcCCS EVSE role)
-        eth0 ─────────── proxy_net2 ─────────── eth1    eth0 ─────── proxy_net1 ─────── eth0
+             ─────────── proxy_net2 ───────────         ─────── proxy_net1 ───────
                                         proxy container
                                 (proxy01.py — SDP hijack
                                   + transparent HLC relay)
@@ -71,32 +71,39 @@ Two independent networks, on two different interfaces of `EVCC` and `SECC`:
   `EVCC` and `SECC` only (the proxy is **not** on it). AcCCS's `PEV.py`/
   `EVSE.py` require a link-local IPv6 address on the interface they're given
   at startup, so `slac_net` must be created with `--ipv6` (a plain `docker
-  network create slac_net` without it leaves `eth1` IPv4-only and AcCCS
-  crashes immediately with `IndexError: list index out of range`).
+  network create slac_net` without it leaves the interface IPv4-only and
+  AcCCS crashes immediately with `IndexError: list index out of range`).
 - At the HLC layer, `EVCC` and `SECC` are **still never on the same
   network** — they can only reach each other through the proxy, which is the
   only container on both `proxy_net1` and `proxy_net2`:
-  - `SECC` → `proxy_net1` (eth0) + `slac_net` (eth1)
-  - `EVCC` → `proxy_net2` (eth0) + `slac_net` (eth1)
+  - `SECC` → `proxy_net1` + `slac_net`
+  - `EVCC` → `proxy_net2` + `slac_net`
   - `Evil_EVSE_Evil_PEV` (the proxy) → `proxy_net1` + `proxy_net2`, not on
     `slac_net` at all
-- `proxy01.py` identifies which of its own interfaces faces SECC vs. EVCC by
-  matching each interface's assigned subnet against the known `proxy_net1`
-  (`172.20.0.0/16` / `2001:db8:1::/64`) and `proxy_net2`
-  (`172.19.0.0/16` / `2001:db8:2::/64`) ranges — **not** by assuming its
-  first (`eth0`) vs. second (`eth1`) interface. Docker does not guarantee
-  `eth0`/`eth1` map to `proxy_net1`/`proxy_net2` in a stable order across
-  container restarts or `docker network connect` calls (verified: it can
-  and does flip), so subnet identity is what actually matters, not
-  interface list position or connect order. Same reasoning applies to the
-  SDP multicast relay: the outgoing interface for that is explicitly pinned
-  to the identified SECC-facing interface (`IPV6_MULTICAST_IF`), rather than
-  left to the kernel's default-route interface pick.
 
-`secc_run_full.sh`/`evcc_run_full.sh` point AcCCS's SLAC step at `eth1`
-(`slac_net`) and the HLC step stays on `eth0` (`NETWORK_INTERFACE` defaults
-to `eth0`, unchanged) — so SLAC now runs as a genuine handshake between the
-two containers, while HLC still goes only through the proxy.
+**Nothing in this repo assumes `eth0`/`eth1` map to a particular network.**
+Docker does not guarantee that mapping stays stable across container
+restarts or `docker network connect`/`disconnect` calls — confirmed twice in
+practice, in two different places:
+
+- `proxy01.py` identifies which of its own interfaces faces SECC vs. EVCC by
+  matching each interface's assigned subnet against the known `proxy_net1`/
+  `proxy_net2` ranges (see "The proxy fix" section below), and pins the SDP
+  multicast relay's outgoing interface the same way
+  (`IPV6_MULTICAST_IF`) instead of trusting the kernel's default-route pick.
+- `secc_run_full.sh`/`evcc_run_full.sh` do the same for their own two
+  interfaces: a `resolve_iface()` shell function greps `ip -br a` for the
+  interface whose address falls in `slac_net`'s subnet (used for the AcCCS
+  SLAC step, `-I <iface>`) vs. the container's own HLC-facing subnet
+  (`proxy_net1` for SECC, `proxy_net2` for EVCC — passed to the EcoG stack
+  via the `NETWORK_INTERFACE` env var it already reads, rather than left to
+  its `eth0` default). This was hit for real: `SECC` ended up with
+  `slac_net` on `eth0` and `proxy_net1` on `eth1` after some earlier
+  reconnects, and since the HLC step never set `NETWORK_INTERFACE`, EcoG's
+  default of `eth0` silently pointed the SDP listener at `slac_net` instead
+  of `proxy_net1` — the proxy's SDP relay had a real destination, SECC's
+  listener was real too, they were just on two different networks, so every
+  run failed with `No SDP response from SECC`.
 
 ## Prerequisites
 
@@ -129,8 +136,8 @@ docker run -dit --network proxy_net1 --name SECC proxy-proxy /bin/bash
 docker run -dit --network proxy_net2 --name EVCC proxy-proxy /bin/bash
 docker run -dit --network proxy_net1 --name Evil_EVSE_Evil_PEV proxy-proxy /bin/bash
 docker network connect proxy_net2 Evil_EVSE_Evil_PEV   # dual-home the proxy
-docker network connect slac_net SECC   # SECC's second interface (eth1) for real SLAC
-docker network connect slac_net EVCC   # EVCC's second interface (eth1) for real SLAC
+docker network connect slac_net SECC   # SECC's second network, for real SLAC
+docker network connect slac_net EVCC   # EVCC's second network, for real SLAC
 
 # Copy this repo's scripts into each container
 docker cp proxy/proxy01.py            Evil_EVSE_Evil_PEV:/usr/src/app/iso15118/proxy01.py
@@ -157,7 +164,7 @@ This starts all three containers, ensures `slac_net` exists and `EVCC`/`SECC`
 are attached to it (idempotent, safe to re-run), launches `tcpdump -i any`
 inside the proxy (the only container that sees *both* legs of the HLC relay
 in one capture) plus per-leg captures on `SECC`/`EVCC` (which also pick up
-the real SLAC exchange on `eth1`, since the proxy never sees it), runs
+the real SLAC exchange on `slac_net`, since the proxy never sees it), runs
 `proxy01.py --capture --show-hex`, then `secc_run_full.sh` and
 `evcc_run_full.sh` in sequence, waits for the HLC session to actually finish,
 stops all captures cleanly (`SIGINT`, so the pcap trailer is written
@@ -167,8 +174,8 @@ repeated runs never clobber each other:
 ```
 captures/
   full_run_<mode>_<ts>.pcap    # proxy's view — both HLC relay legs, the authoritative HLC capture
-  secc_run_<mode>_<ts>.pcap    # SECC's own HLC leg + the real SLAC handshake on eth1
-  evcc_run_<mode>_<ts>.pcap    # EVCC's own HLC leg + the real SLAC handshake on eth1
+  secc_run_<mode>_<ts>.pcap    # SECC's own HLC leg + the real SLAC handshake on slac_net
+  evcc_run_<mode>_<ts>.pcap    # EVCC's own HLC leg + the real SLAC handshake on slac_net
   proxy_demo_<mode>_<ts>.log   # proxy01.py's relay/decode log
   secc_demo_<mode>_<ts>.log    # SECC-side SLAC + HLC stdout
   evcc_demo_<mode>_<ts>.log    # EVCC-side SLAC + HLC stdout
@@ -288,8 +295,8 @@ Example captures from a single, real run are included in
   `SupportedAppProtocol` through `SessionStop`): the HLC/TLS side, captured
   on the proxy.
 - `secc_run_slac_handshake.pcap` and `secc_demo_slac_handshake.log`: the real
-  SLAC handshake from the same run, captured on `SECC`'s `eth1` (`slac_net`)
-  — `CM_SET_KEY.REQ` → `CM_SLAC_PARM.REQ`/`CNF` → `CM_START_ATTEN_CHAR.IND` →
+  SLAC handshake from the same run, captured on `SECC`'s `slac_net`
+  interface — `CM_SET_KEY.REQ` → `CM_SLAC_PARM.REQ`/`CNF` → `CM_START_ATTEN_CHAR.IND` →
   repeated `CM_MNBC_SOUND.IND` → `CM_ATTEN_CHAR.IND`/`RSP` →
   `CM_SLAC_MATCH.REQ`/`CNF`, ending in `EVSE: Done SLAC`.
 
@@ -336,6 +343,12 @@ ranges (`discover_secc_evcc_interfaces()`), and pins the outgoing SDP
 multicast relay to the identified SECC-facing interface
 (`IPV6_MULTICAST_IF`) instead of trusting the kernel's default-route pick —
 so it self-corrects regardless of connect order.
+
+The same class of bug independently hit `secc_run_full.sh`/`evcc_run_full.sh`
+(both trusted a fixed `eth0` = HLC-facing, `eth1` = `slac_net` assumption)
+and got the same fix, applied per-script via a small `resolve_iface()`
+shell function — see [Topology](#topology) for the details and how it was
+actually reproduced.
 
 ## Repo layout
 
