@@ -190,6 +190,60 @@ docker exec -it EVCC bash
 /usr/src/app/evcc_run_full.sh
 ```
 
+## Live demo
+
+For presenting this live (a talk, someone watching over your shoulder),
+`run_full_demo.sh` isn't great — it backgrounds everything and only shows
+progress messages like `--- Starting SECC (SLAC then HLC) ---`, with the
+actual SLAC/SDP/TLS/EXI output invisible until you read the log files
+afterward. `run_live_demo.sh` runs the identical flow (same setup, same
+`tls`/`notls` mode argument, same capture files at the end) but streams
+`proxy01.py`'s and both `*_run_full.sh`'s output live, interleaved and
+labeled, into the terminal as it happens:
+
+```bash
+./scripts/run_live_demo.sh        # TLS/PnC session (default)
+./scripts/run_live_demo.sh notls  # plaintext EIM/AC session
+```
+
+Each line is prefixed `[PROXY]`, `[SECC]`, or `[EVCC]` (color-coded cyan/
+yellow/green if the terminal supports it, plain text otherwise), so a viewer
+can follow SLAC happening on both sides, then the SDP hijack, then the
+TLS handshake or plaintext EXI messages, in the order they actually occur:
+
+```
+[SECC]  INFO (EVSE): Recieved SLAC_PARM_REQ
+[SECC]  INFO (EVSE): Sending CM_SLAC_PARM_CNF
+[EVCC]  INFO (PEV) : Sending 10 MNBC_SOUND_IND
+[SECC]  INFO (EVSE): Sending SLAC_MATCH_CNF
+[SECC]  INFO (EVSE): Done SLAC
+[EVCC]  INFO (PEV) : Done SLAC
+[PROXY] SECC SDP Response: 01fe900100000014fe800000000000006c57defffecc1954edcf0000
+[PROXY]   SECC IP: fe80::6c57:deff:fecc:1954
+[PROXY] Sent modified SDP response to EVCC at ('fe80::74bb:eff:fe7d:a415', 35019, 0, 3)
+[PROXY] Accepted TCP connection from EVCC: ('fe80::74bb:eff:fe7d:a415', 35472, 0, 3)
+[EVCC]  INFO    ... comm_session_handler (416): Starting TLS client, trying to connect to ...
+```
+
+Implementation: each source still logs to its own file in the container
+(same as `run_full_demo.sh`), and the script attaches `docker exec ...
+tail -F -n +1 <logfile> | sed -u 's/^/[LABEL] /'` to each one in the
+background *before* starting proxy/SECC/EVCC, so nothing is missed. `tail
+-F` (not `-f`) is what makes this work across the log file being truncated
+when the actual process's own `> logfile` redirection opens.
+
+Ctrl+C at any point is safe: it stops the streamers and `tcpdump`
+(`SIGINT`, so the pcap trailer is still written correctly) and copies out
+whatever was captured so far, same as letting it finish normally — you just
+get a shorter/partial capture. Two things worth knowing if you're modifying
+this script: `$!` right after `cmd1 | cmd2 &` only captures `cmd2`'s PID
+(here, `sed`) — killing that leaves the `docker exec ... tail -F` process
+orphaned indefinitely, since it has nothing left to write to and never gets
+`SIGPIPE`, so cleanup instead kills by matching the actual command line
+(`pkill -f`). And unlike an `EXIT` trap, bash's `INT`/`TERM` traps don't
+stop the script after the handler returns on their own — the cleanup
+function ends with an explicit `exit` to actually stop it.
+
 ### TLS / Plug & Charge vs. plaintext
 
 The orchestrator takes a mode argument, so the two demos you actually run are:
@@ -290,6 +344,7 @@ proxy/proxy01.py         The MITM relay (SDP hijack + transparent TCP/TLS relay)
 scripts/secc_run_full.sh  SLAC (AcCCS EVSE role) then HLC (EcoG SECC) in one command
 scripts/evcc_run_full.sh  SLAC (AcCCS PEV role) then HLC (EcoG EVCC, TLS/PnC) in one command
 scripts/run_full_demo.sh  Host-side orchestrator: sets up slac_net, runs everything + captures pcaps
+scripts/run_live_demo.sh  Same flow, streamed live/labeled to the terminal -- see "Live demo"
 scripts/regen_certs.sh    Regenerates the ISO 15118-2 PKI and syncs it SECC -> EVCC
 examples/                 Sample captures + logs from a working SLAC + TLS/PnC run
 ```
