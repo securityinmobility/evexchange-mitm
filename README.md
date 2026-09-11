@@ -88,9 +88,10 @@ practice, in two different places:
 
 - `proxy01.py` identifies which of its own interfaces faces SECC vs. EVCC by
   matching each interface's assigned subnet against the known `proxy_net1`/
-  `proxy_net2` ranges (see "The proxy fix" section below), and pins the SDP
-  multicast relay's outgoing interface the same way
-  (`IPV6_MULTICAST_IF`) instead of trusting the kernel's default-route pick.
+  `proxy_net2` ranges (see `discover_secc_evcc_interfaces()` in
+  `proxy/proxy01.py` for the implementation), and pins the SDP multicast
+  relay's outgoing interface the same way (`IPV6_MULTICAST_IF`) instead of
+  trusting the kernel's default-route pick.
 - `secc_run_full.sh`/`evcc_run_full.sh` do the same for their own two
   interfaces: a `resolve_iface()` shell function greps `ip -br a` for the
   interface whose address falls in `slac_net`'s subnet (used for the AcCCS
@@ -365,8 +366,7 @@ line regardless of `--debug`/`--show-hex`:
 ```
 
 **Only takes effect in `notls` mode.** The proxy relays TLS as an opaque
-encrypted byte stream (see "The proxy fix" below) without terminating it
-itself — tampering TLS-protected content would need a full TLS-interception
+encrypted byte stream without terminating it itself — tampering TLS-protected content would need a full TLS-interception
 MITM (present the proxy's own certificate to EVCC, open a separate TLS
 connection to SECC, decrypt/modify/re-encrypt in the middle), which this
 does not implement. `tls tamper` runs without error but has no effect
@@ -399,60 +399,6 @@ ends:
 An example capture is included in [`examples/`](./examples):
 `full_run_tamper.pcap`, `proxy_demo_tamper.log` (shows the `[TAMPER]` line),
 and `evcc_demo_tamper.log` (shows EVCC decoding the tampered `63A` value).
-
-While fixing this, `proxy01.py`'s own EXI codec turned out to be broken:
-see the next section.
-
-## The proxy fix (`proxy01.py`)
-
-The version of `proxy01.py` in this repo fixes a framing bug in the original:
-the original peeked exactly 5 bytes of the incoming stream to sniff for TLS
-(`first_bytes[0] == 0x16`) and forwarded those 5 bytes immediately, before
-handing off to the generic relay loop — which split the first V2GTP message
-across two separate TCP writes. `iso15118`'s SECC-side parser doesn't buffer
-partial reads, so it rejected the truncated first fragment
-(`InvalidV2GTPMessageError: only 5 bytes`) and the session died immediately.
-
-Fixed version: peek only **1** byte to distinguish TLS (`0x16`) from
-plaintext. For plaintext, read the full 8-byte V2GTP header (1B version, 1B
-inverse version, 2B payload type, 4B payload length), parse the real payload
-length, then read exactly that many more bytes — so SECC always receives one
-complete V2GTP message per write. TLS framing is left to the TLS layer
-itself, same as before.
-
-It also fixes an interface-identity bug: the original discovered its own
-addresses via `ip a` and assumed the first-listed interface faced SECC and
-the second faced EVCC. That assumption breaks silently whenever Docker
-attaches/reconnects the two networks in the other order (which it does not
-guarantee against — confirmed by deliberately reconnecting `proxy_net1`/
-`proxy_net2` in the wrong order and watching the SDP relay time out with
-`No SDP response from SECC`). Fixed version identifies each interface by
-matching its actual subnet against the known `proxy_net1`/`proxy_net2`
-ranges (`discover_secc_evcc_interfaces()`), and pins the outgoing SDP
-multicast relay to the identified SECC-facing interface
-(`IPV6_MULTICAST_IF`) instead of trusting the kernel's default-route pick —
-so it self-corrects regardless of connect order.
-
-The same class of bug independently hit `secc_run_full.sh`/`evcc_run_full.sh`
-(both trusted a fixed `eth0` = HLC-facing, `eth1` = `slac_net` assumption)
-and got the same fix, applied per-script via a small `resolve_iface()`
-shell function — see [Topology](#topology) for the details and how it was
-actually reproduced.
-
-It also fixes a third, more basic bug found while building the
-[content tampering](#content-tampering) feature: `proxy01.py`'s own
-`ExificientEXICodec` class only implemented `decode()`, not `encode()` or
-`get_version()` — but it subclassed `IEXICodec`, an abstract base class that
-requires all three. Instantiating it (`--debug`, or anything else that
-needed the codec) raised `TypeError: Can't instantiate abstract class
-ExificientEXICodec with abstract methods encode, get_version` immediately,
-silently killing the session — meaning `--debug` had never actually worked.
-Fixed by dropping the partial reimplementation entirely and reusing the
-real, complete codec the SECC/EVCC processes themselves already use
-(`iso15118.shared.exificient_exi_codec.ExificientEXICodec`), wrapped in a
-thin async shim (`ProxyCodec`). This also guarantees `encode()`'s output
-stays schema-compatible with whatever this iso15118 version actually
-expects, which a hand-rolled encoder would risk getting subtly wrong.
 
 ## Repo layout
 
