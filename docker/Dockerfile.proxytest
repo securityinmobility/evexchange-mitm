@@ -16,6 +16,27 @@ FROM python:3.10.0-bullseye AS build
 
 WORKDIR /usr/src/app
 
+# python:3.10.0-bullseye's default apt sources point at the live
+# deb.debian.org/security.debian.org mirrors. Debian bullseye is EOL and
+# its security Release file has stopped being refreshed there, so apt
+# refuses it as expired ("Release file ... is expired") -- confirmed the
+# hard way: this only worked on machines with an old cached apt layer from
+# before the Release file actually expired (e.g. this image's original
+# October 2025 build), and fails immediately on a genuinely fresh build/
+# cache. Redirect to archive.debian.org for the regular suites, same fix
+# already applied for buster elsewhere in this project
+# (virtual-charging-station's run_demo.sh bootstrap step) -- but unlike
+# that fix, archive.debian.org doesn't mirror bullseye-security under the
+# path apt expects either (404s on the Release file), so that line is
+# dropped entirely rather than redirected. None of the packages this stage
+# installs (net-tools, iproute2, nano, git, wget, default-jre, tcpdump) are
+# security-sensitive for a research/demo container, so losing security-repo
+# coverage here is an acceptable tradeoff for a build that actually
+# completes. Check-Valid-Until is also disabled as a safety net for the
+# remaining suites.
+RUN sed -i -e 's|deb.debian.org|archive.debian.org|g' -e '/security.debian.org/d' /etc/apt/sources.list \
+    && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
 RUN apt-get update && apt-get install -y net-tools iproute2 nano git wget default-jre tcpdump
 # All four clones below are pinned to the exact commits proven to work
 # together (as of the last verified evexchange-mitm run). None of these
