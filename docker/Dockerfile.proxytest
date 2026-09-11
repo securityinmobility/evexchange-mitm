@@ -1,0 +1,101 @@
+# Builds the `proxy-proxy` image: EcoG iso15118 + mod_acccs (AcCCS with
+# SLAC_ONLY) + HomePlugPWN + V2GInjector, all bundled together. This is
+# what EVCC/SECC/Evil_EVSE_Evil_PEV all run in the main README's setup.
+#
+# Build with:
+#   docker build -f docker/Dockerfile.proxytest -t proxy-proxy .
+#
+# Kept as originally authored/pinned rather than cleaned up -- this is the
+# exact file proven to produce a working image; see "Tested versions" in
+# the main README for what each clone is pinned to and why.
+
+# First stage: build
+FROM python:3.10.0-bullseye AS build
+
+#RUN apt-get update && apt-get install -y net-tools iproute2 nano git wget default-jre tcpdump
+
+WORKDIR /usr/src/app
+
+RUN apt-get update && apt-get install -y net-tools iproute2 nano git wget default-jre tcpdump
+# All four clones below are pinned to the exact commits proven to work
+# together (as of the last verified evexchange-mitm run). None of these
+# upstreams offer stability guarantees between commits -- an unpinned clone
+# will silently pull whatever is HEAD at build time, which can break
+# proxy01.py (EcoG's settings/config/message-flow internals changing),
+# the SLAC_ONLY integration (mod_acccs), or the SLAC/HomePlug tooling
+# (HomePlugPWN/V2GInjector) in ways that are hard to diagnose later.
+# Bump deliberately and re-test end to end, don't drop the pins.
+RUN git clone https://github.com/EcoG-io/iso15118.git && \
+    cd iso15118 && git checkout b256f9b379d3c0acbea24258c4a184f5264950a2 && cd ..
+RUN git clone https://github.com/vvvasu/mod_acccs.git && \
+    cd mod_acccs && git checkout fa1d08ea4c679cb37562c26a8775b0c86aab0d99 && cd ..
+
+WORKDIR /usr/src/app/mod_acccs/external_libs
+
+RUN git clone https://github.com/JakeMG-INL/HomePlugPWN.git && \
+    cd HomePlugPWN && git checkout ff840e707b0c54e06b1c836ed47112daffefd200 && cd ..
+RUN git clone https://github.com/JakeMG-INL/V2GInjector.git && \
+    cd V2GInjector && git checkout 1823d055fe72f2613e3052736e3fc9071cba5f9f && cd ..
+
+WORKDIR /usr/src/app/iso15118
+
+ENV PYTHONFAULTHANDLER=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONHASHSEED=random \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
+    POETRY_VERSION=1.3.2 \
+    VIRTUALENV_PIP=21.2.1 \
+    MYPY_VERSION=0.930
+
+RUN pip install "poetry==$POETRY_VERSION" "mypy==$MYPY_VERSION"
+
+#WORKDIR /usr/src/app
+#COPY .coveragerc mypy.ini .flake8 poetry.lock pyproject.toml ./
+#------------------------------------------------------------------------
+
+RUN sed -i 's/secc/secc/g' pyproject.toml
+RUN poetry install --no-interaction --no-ansi
+#---COPY iso15118/ iso15118/
+RUN poetry build
+
+# Second stage: runtime
+#FROM python:3.10.0-bullseye
+#WORKDIR /usr/src/app
+
+#RUN apt update && apt install -y default-jre
+RUN python -m venv /venv
+#COPY --from=build . .
+#COPY --from=build /usr/src/app/dist/ dist/
+#----COPY --from=build /usr/src/app/iso15118/dist/ dist/
+RUN /venv/bin/pip install dist/*.whl
+
+#----COPY --from=build /usr/src/app/iso15118/ /usr/src/app/iso15118/
+#COPY --from=build /usr/src/app/iso15118/shared/pki/ /usr/src/app/iso15118/shared/pki/
+#COPY --from=build /usr/src/app/iso15118/shared/examples/evcc/iso15118_2/ /usr/src/app/iso15118/shared/examples/evcc/iso15118_2/
+
+RUN /venv/bin/pip install aiofile
+#WORKDIR /usr/src/app/iso15118/iso15118/shared/pki
+
+#--COPY dynamic_proxy.py /app/iso15118
+#--COPY mod_proxy.py /app/iso15118
+#--COPY manual_config_proxy.py /app/iso15118
+#--COPY dyn_tlsoff_proxy.py /app/iso15118
+
+RUN pip install environs py4j scapy requests tqdm
+
+#--WORKDIR iso15118/shared/pki/
+
+#--ENV SLAC_ONLY=1
+
+WORKDIR /usr/src/app/iso15118/iso15118/shared/pki
+
+RUN ./create_certs.sh -v iso-2 && \
+    ./create_certs.sh -v iso-20
+
+#ENV SLAC_ONLY=1
+
+WORKDIR /usr/src/app
+
+CMD ["/bin/sh", "-c", "tail -f /dev/null"]

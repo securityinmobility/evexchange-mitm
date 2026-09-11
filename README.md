@@ -109,28 +109,35 @@ practice, in two different places:
 ## Prerequisites
 
 - Docker (with IPv6-enabled bridge networking).
-- The `proxy-proxy` image, built from
-  [`virtual-charging-station/Proxy`](https://github.com/securityinmobility/virtual-charging-station)'s
-  `Dockerfile.proxytest` — this image bundles the EcoG `iso15118` stack,
+- The `proxy-proxy` image, built from this repo's own
+  [`docker/Dockerfile.proxytest`](./docker/Dockerfile.proxytest) — it
+  bundles the EcoG `iso15118` stack,
   [`mod_acccs`](https://github.com/vvvasu/mod_acccs) (AcCCS), and
   `HomePlugPWN`/`V2GInjector` all together. All three containers below
   (`EVCC`, `SECC`, `Evil_EVSE_Evil_PEV`) run this same image, just started
   with different names/networks/entrypoints.
 
 ```bash
-git clone git@github.com:securityinmobility/virtual-charging-station.git
-cd virtual-charging-station/Proxy
-docker compose build --no-cache   # -> image `proxy-proxy`
+git clone git@github.com:securityinmobility/evexchange-mitm.git
+cd evexchange-mitm
+docker build -f docker/Dockerfile.proxytest -t proxy-proxy .
 ```
+
+⚠️ Don't confuse this with `virtual-charging-station/Proxy`'s own
+`docker compose build` — that builds a *different*, older Dockerfile
+(`Dockerfile.proxy`) that also happens to produce an image named
+`proxy-proxy`, but without any of the AcCCS/SLAC/mod_acccs integration this
+repo needs. Building the wrong one looks identical (succeeds, same image
+name) until the `docker cp`/setup steps below fail with "Could not find the
+file `/usr/src/app`" — if you hit that, this is why.
 
 ### Tested versions 📌
 
-`Dockerfile.proxytest` clones all four dependencies below unpinned by
-default (whatever's HEAD at build time), which is exactly what let this
-setup silently drift out of sync with itself once before. Pin each `git
-clone` in `Dockerfile.proxytest` to these commits — they're what every
-result in this README (`examples/`, the live-demo output, the SLAC/HLC
-captures) was actually produced against:
+`docker/Dockerfile.proxytest` pins all four dependencies below to specific
+commits — unpinned clones (whatever's HEAD at build time) are exactly what
+let this setup silently drift out of sync with itself once before. They're
+what every result in this README (`examples/`, the live-demo output, the
+SLAC/HLC captures) was actually produced against:
 
 | Dependency | Pinned at | Last verified working |
 |---|---|---|
@@ -403,6 +410,7 @@ and `evcc_demo_tamper.log` (shows EVCC decoding the tampered `63A` value).
 ## Repo layout
 
 ```
+docker/Dockerfile.proxytest  Builds the proxy-proxy image (iso15118 + mod_acccs + HomePlugPWN/V2GInjector)
 proxy/proxy01.py         The MITM relay (SDP hijack + transparent TCP/TLS relay)
 scripts/secc_run_full.sh  SLAC (AcCCS EVSE role) then HLC (EcoG SECC) in one command
 scripts/evcc_run_full.sh  SLAC (AcCCS PEV role) then HLC (EcoG EVCC, TLS/PnC) in one command
