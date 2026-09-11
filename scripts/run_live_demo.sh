@@ -45,7 +45,10 @@ if [ "$TAMPER_ARG" = "tamper" ]; then
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
-HOST_CAPDIR="/home/vasu/newtest001/captures"
+# Resolve relative to this script's own location (repo_root/scripts/..),
+# not a hardcoded user-specific path -- so this works regardless of who
+# cloned the repo or where, landing captures in <repo_root>/captures.
+HOST_CAPDIR="$(cd "$(dirname "$0")/.." && pwd)/captures"
 mkdir -p "$HOST_CAPDIR"
 
 # Color-code the three sources if stdout is a real terminal; degrade to
