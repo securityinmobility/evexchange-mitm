@@ -1,0 +1,97 @@
+# One-time setup, compose form. Replaces the network create / docker run /
+# docker cp block in the README's "One-time setup" section.
+#
+# `command:` on each service also rebuilds what run_live_demo.sh used to do
+# from the host via `docker exec` (see scripts/compose_*_entry.sh) -- so
+# unlike the Dockerfile's own idle `tail -f /dev/null` CMD, `docker compose
+# up` here goes straight into the live SLAC+HLC MITM run: tcpdump starts in
+# each container, then each container's *_run_full.sh, with output shown
+# live, labeled/colored per-service by compose itself. Ctrl-C (or
+# `docker compose down`) stops tcpdump with SIGINT first, for a clean pcap
+# trailer, same as run_live_demo.sh's own cleanup().
+#
+# Usage:
+#   EVCC_MODE=tls TAMPER=1 docker compose up --build   # tamper only takes
+#                                                       # effect in notls
+#   ./scripts/regen_certs.sh   # still separate: it execs create_certs.sh
+#                               # inside SECC, not a static file copy
+#
+# Pcaps/logs land directly in ./captures on the host (bind-mounted), so no
+# docker cp step is needed afterwards either.
+#
+# To get the old idle-container shell instead (e.g. for manual/interactive
+# use): `docker compose run --rm --entrypoint /bin/bash SECC`.
+#
+# Bind-mounted scripts keep the host's execute bit (Linux bind mounts
+# preserve host file mode), so the old `chmod +x` docker exec calls aren't
+# needed here.
+
+x-proxy-build: &proxy-build
+  context: .
+  dockerfile: docker/Dockerfile.proxytest
+
+services:
+  SECC:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: SECC
+    tty: true
+    stdin_open: true
+    command: /usr/src/app/compose_secc_entry.sh
+    networks:
+      - proxy_net1
+    volumes:
+      - ./scripts/secc_run_full.sh:/usr/src/app/secc_run_full.sh:ro
+      - ./scripts/compose_secc_entry.sh:/usr/src/app/compose_secc_entry.sh:ro
+      - ./captures:/captures
+
+  EVCC:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: EVCC
+    tty: true
+    stdin_open: true
+    command: /usr/src/app/compose_evcc_entry.sh
+    environment:
+      EVCC_MODE: ${EVCC_MODE:-tls}   # tls (default) or notls
+    networks:
+      - proxy_net2
+    volumes:
+      - ./scripts/evcc_run_full.sh:/usr/src/app/evcc_run_full.sh:ro
+      - ./scripts/compose_evcc_entry.sh:/usr/src/app/compose_evcc_entry.sh:ro
+      - ./captures:/captures
+
+  Evil_EVSE_Evil_PEV:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: Evil_EVSE_Evil_PEV
+    tty: true
+    stdin_open: true
+    command: /usr/src/app/compose_proxy_entry.sh
+    environment:
+      TAMPER: ${TAMPER:-}   # 1 = tamper EVSEMaxCurrent (notls sessions only)
+    networks:        # dual-homed: proxy_net1 (SECC-facing) + proxy_net2 (EVCC-facing)
+      - proxy_net1
+      - proxy_net2
+    volumes:
+      - ./proxy/proxy01.py:/usr/src/app/iso15118/proxy01.py:ro
+      - ./scripts/proxy_run_full.sh:/usr/src/app/proxy_run_full.sh:ro
+      - ./scripts/compose_proxy_entry.sh:/usr/src/app/compose_proxy_entry.sh:ro
+      - ./captures:/captures
+
+networks:
+  proxy_net1:
+    name: proxy_net1
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: 2001:db8:1::/64
+
+  proxy_net2:
+    name: proxy_net2
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+        - subnet: 2001:db8:2::/64
