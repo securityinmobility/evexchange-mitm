@@ -21,6 +21,13 @@ parser.add_argument("--debug", action="store_true", help="Enable EXI decoding fo
 parser.add_argument("--tamper", action="store_true",
                      help="Tamper with EVSEMaxCurrent in ChargeParameterDiscoveryRes "
                           "(non-TLS sessions only). Same effect as TAMPER=1.")
+parser.add_argument("--secc-iface", metavar="IFACE",
+                     help="Explicit interface name facing SECC (e.g. eth0), used instead "
+                          "of auto-detecting by Docker subnet (proxy_net1). For real "
+                          "hardware, where the physical NIC won't be on that subnet.")
+parser.add_argument("--evcc-iface", metavar="IFACE",
+                     help="Explicit interface name facing EVCC (e.g. eth1), used instead "
+                          "of auto-detecting by Docker subnet (proxy_net2). See --secc-iface.")
 args = parser.parse_args()
 
 CAPTURE_FILE = "proxy_capture.log"
@@ -120,29 +127,37 @@ async def decode_with_fallback(codec, payload: bytes):
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
-async def discover_secc_evcc_interfaces():
+async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None):
     """
     Identify which local interface faces SECC's network (proxy_net1) and
-    which faces EVCC's (proxy_net2) by matching each interface's actual
-    assigned subnet (IPv4 and/or global IPv6) against the known
+    which faces EVCC's (proxy_net2).
+
+    Default (secc_iface/evcc_iface both None): match each interface's
+    actual assigned subnet (IPv4 and/or global IPv6) against the known
     SECC_NET_*/EVCC_NET_* ranges. This is self-correcting regardless of
     which order the interfaces were connected in -- it does not rely on
-    `ip a` listing order at all.
+    `ip a` listing order at all. This is what the Docker demo
+    (run_full_demo.sh etc.) relies on.
+
+    If secc_iface/evcc_iface are given (--secc-iface/--evcc-iface on the
+    CLI), match by interface name instead -- for real hardware, where the
+    physical NICs won't be on proxy_net1's/proxy_net2's specific Docker
+    subnets, so the caller names them explicitly (e.g. "eth0"/"eth1").
 
     Returns {"secc": (link_local_addr, scope_id), "evcc": (link_local_addr, scope_id)},
-    with a role missing if no interface matched its subnet.
+    with a role missing if no interface matched.
     """
     result = await asyncio.create_subprocess_shell('ip a', stdout=asyncio.subprocess.PIPE)
     stdout, _ = await result.communicate()
     lines = stdout.decode().splitlines()
 
-    interfaces = {}  # scope_id -> {"v4": str, "v6_global": str, "v6_link": str}
+    interfaces = {}  # scope_id -> {"name": str, "v4": str, "v6_global": str, "v6_link": str}
     current_scope_id = None
     for line in lines:
         header_match = iface_header_pattern.match(line)
         if header_match:
             current_scope_id = int(header_match.group(1))
-            interfaces.setdefault(current_scope_id, {})
+            interfaces[current_scope_id] = {"name": header_match.group(2)}
             continue
         if current_scope_id is None:
             continue
@@ -156,7 +171,25 @@ async def discover_secc_evcc_interfaces():
         if v6_link_match:
             interfaces[current_scope_id]["v6_link"] = v6_link_match.group(1)
 
-    def identify_role(addrs):
+    if secc_iface or evcc_iface:
+        by_name = {addrs["name"]: (scope_id, addrs) for scope_id, addrs in interfaces.items()}
+        roles = {}
+        for role, wanted_name in (("secc", secc_iface), ("evcc", evcc_iface)):
+            if not wanted_name:
+                continue
+            if wanted_name not in by_name:
+                print(f"WARNING: --{role}-iface {wanted_name} not found in `ip a` output")
+                continue
+            scope_id, addrs = by_name[wanted_name]
+            link = addrs.get("v6_link")
+            if not link:
+                print(f"WARNING: {wanted_name} (--{role}-iface) has no link-local IPv6 "
+                      f"address -- is the interface up?")
+                continue
+            roles[role] = (link, scope_id)
+        return roles
+
+    def identify_role_by_subnet(addrs):
         v4 = addrs.get("v4")
         v6g = addrs.get("v6_global")
         try:
@@ -177,7 +210,7 @@ async def discover_secc_evcc_interfaces():
         link = addrs.get("v6_link")
         if not link:
             continue
-        role = identify_role(addrs)
+        role = identify_role_by_subnet(addrs)
         if role:
             roles[role] = (link, scope_id)
 
@@ -425,9 +458,13 @@ async def start_tcp_proxy(start_event):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    roles = loop.run_until_complete(discover_secc_evcc_interfaces())
+    roles = loop.run_until_complete(
+        discover_secc_evcc_interfaces(secc_iface=args.secc_iface, evcc_iface=args.evcc_iface)
+    )
 
-    print("\nSECC and EVCC network interfaces (identified by subnet, not list order):")
+    detect_desc = ("explicit --secc-iface/--evcc-iface" if (args.secc_iface or args.evcc_iface)
+                   else "Docker subnet auto-detect, not list order")
+    print(f"\nSECC and EVCC network interfaces (identified by {detect_desc}):")
     local_ips = set()
     for role, (addr, scope) in roles.items():
         print(f"  {role}: {addr} -> scope {scope}")
@@ -437,16 +474,25 @@ if __name__ == "__main__":
         secc_ip, secc_scope_id = roles["secc"]
     else:
         secc_ip, secc_scope_id = None, None
-        print(f"WARNING: no interface found on the SECC subnet "
-              f"({SECC_NET_V4} / {SECC_NET_V6}) -- SDP relay to SECC will fail.")
+        if args.secc_iface:
+            print(f"WARNING: --secc-iface {args.secc_iface} did not resolve to a usable "
+                  f"interface -- SDP relay to SECC will fail.")
+        else:
+            print(f"WARNING: no interface found on the SECC subnet "
+                  f"({SECC_NET_V4} / {SECC_NET_V6}) -- SDP relay to SECC will fail. "
+                  f"On real hardware, pass --secc-iface instead.")
 
     if "evcc" in roles:
         evcc_ip, evcc_scope_id = roles["evcc"]
     else:
         evcc_ip, evcc_scope_id = None, None
-        print(f"WARNING: no interface found on the EVCC subnet "
-              f"({EVCC_NET_V4} / {EVCC_NET_V6}) -- EVCC will never get a "
-              f"usable SDP response.")
+        if args.evcc_iface:
+            print(f"WARNING: --evcc-iface {args.evcc_iface} did not resolve to a usable "
+                  f"interface -- EVCC will never get a usable SDP response.")
+        else:
+            print(f"WARNING: no interface found on the EVCC subnet "
+                  f"({EVCC_NET_V4} / {EVCC_NET_V6}) -- EVCC will never get a "
+                  f"usable SDP response. On real hardware, pass --evcc-iface instead.")
 
     start_event = asyncio.Event()
     udp_task = loop.create_task(udp_listen_and_print("eth0", start_event, local_ips))
