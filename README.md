@@ -430,84 +430,25 @@ An example capture is included in [`examples/`](./examples):
 `full_run_tamper.pcap`, `proxy_demo_tamper.log` (shows the `[TAMPER]` line),
 and `evcc_demo_tamper.log` (shows EVCC decoding the tampered `63A` value).
 
-## Running against real hardware (HLC-only)
+## Running with your own MITM hardware (HLC-only)
 
-If you already have SLAC handled some other way — real EVCC/SECC hardware
-(e.g. two Raspberry Pis) doing a genuine SLAC handshake with each other
-directly — you can run just the HLC MITM (`proxy01.py`) on a third Pi in the
-middle, without any of the AcCCS/SLAC pieces this repo's Docker demo also
-sets up. This only intercepts HLC, the same as the rest of this repo did
-before the [SLAC extension](#topology) — SLAC still happens directly between
-the real EVCC and SECC, outside this proxy's view.
+For demonstrating this on real hardware: `SECC` and `EVCC` stay exactly as
+the rest of this README builds them — Docker containers, unchanged. SLAC is
+assumed to be handled by your own separate setup, outside this repo's
+scope, so the containers skip it. The MITM itself is your own device,
+replacing the `Evil_EVSE_Evil_PEV` container — but it needs *this repo's*
+HLC MITM software (`proxy01.py`) actually running on it; owning the
+hardware doesn't include the interception logic, that's what this section
+sets up.
 
-**Topology.** The MITM Pi needs **two** physical network interfaces, one
-wired to each real endpoint (a direct cable, or its own small switch per
-leg) — *not* one shared switch with all three devices on it. A real switch
-forwards EVCC's and SECC's traffic straight to each other once it learns
-their MAC addresses, which bypasses the proxy entirely. A Pi's built-in
-Ethernet is one port, so the MITM Pi typically needs a USB-Ethernet adapter
-for the second interface:
-
-```
-EVCC-pi  ── (link 1) ──  MITM-pi  ── (link 2) ──  SECC-pi
-           1 NIC each                 2 NICs
-```
-
-**Build the image on the Pi itself** (so Docker picks the ARM64 base image
-automatically — no cross-compilation needed):
-
-```bash
-git clone git@github.com:securityinmobility/evexchange-mitm.git
-cd evexchange-mitm
-docker build -f docker/Dockerfile.proxytest -t proxy-proxy .
-```
-
-**Run just the proxy**, with the container sharing the Pi's real network
-stack (`--network host`) so it can see the two physical interfaces
-directly, and tell it which interface faces which side by name instead of
-by Docker subnet (`--secc-iface`/`--evcc-iface` — see `proxy01.py`'s
-`discover_secc_evcc_interfaces()`; auto-detect-by-subnet is what the rest
-of this README's Docker demo uses, and doesn't apply here since these are
-real interfaces, not `proxy_net1`/`proxy_net2`):
-
-```bash
-docker run -dit --network host --name Evil_EVSE_Evil_PEV proxy-proxy /bin/bash
-docker cp proxy/proxy01.py Evil_EVSE_Evil_PEV:/usr/src/app/iso15118/proxy01.py
-docker exec -it Evil_EVSE_Evil_PEV bash -c \
-  "cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex \
-     --secc-iface eth0 --evcc-iface eth1"
-```
-
-Replace `eth0`/`eth1` with whatever `ip -br a` on the Pi actually shows for
-the two links. `--tamper`, `--debug`, `--capture`, `--show-hex` all work the
-same as in the Docker demo (see [Content tampering](#content-tampering)
-above) — nothing about the relay/tamper/decode logic changed, only how the
-two interfaces are identified.
-
-**What this doesn't assume**: `proxy01.py` only needs to speak standard
-ISO 15118 SDP (UDP multicast to `ff02::1`, port `15118`) and TCP/TLS/EXI on
-the wire — it has no dependency on the real EVCC/SECC hardware running the
-same EcoG `iso15118` stack this repo's Docker demo uses. It does still
-import `iso15118.shared.exificient_exi_codec` at startup for EXI
-decode/encode (used by `--debug`/`--tamper`), which is why it still needs
-to run from inside the `proxy-proxy` image (or any environment with that
-package installed) even in this HLC-only mode.
-
-## Bringing your own MITM hardware (EVCC/SECC stay Dockerized)
-
-This is the opposite combination from the section above: here, `EVCC` and
-`SECC` stay exactly as the rest of this README builds them — Docker
-containers doing SLAC + HLC via AcCCS/EcoG — but the MITM itself is a real
-device you already have, sitting in for the `Evil_EVSE_Evil_PEV` container
-instead of running it. Use this when the interception hardware is a given
-and you just need `EVCC`/`SECC` to be real ISO 15118 endpoints for it to
-sit between.
-
-**Topology.** Same "two separate physical links, no shared switch" reasoning
-as [Topology](#topology) above — a shared switch lets `EVCC` and `SECC`
-reach each other directly and bypasses whatever's intercepting — except now
-it's the Docker *host's* two NICs standing in for the proxy container's two
-interfaces, cabled out to your MITM device's two NICs:
+**Topology.** The MITM device needs **two** physical network interfaces —
+one wired to each Docker container's network (a direct cable, or its own
+small switch per leg) — *not* one shared switch with everything on it. A
+real switch would forward `EVCC`'s and `SECC`'s traffic straight to each
+other once it learns their MAC addresses, bypassing the MITM device
+entirely — same "two separate physical links" reasoning as
+[Topology](#topology) above, just with the Docker host's own two NICs
+standing in for the proxy container's two interfaces:
 
 ```
 EVCC container  ──(host NIC A)── real MITM device ──(host NIC B)──  SECC container
@@ -536,16 +477,13 @@ calls here and for the `resolve_iface()` prefixes in
 `secc_run_full.sh`/`evcc_run_full.sh` — otherwise interface auto-detection
 won't match. **Untested here** (no multi-NIC hardware to verify against) —
 try this against your actual host before relying on it for a live
-demonstration.
+demonstration. Skip `Evil_EVSE_Evil_PEV` entirely — don't create or start
+that container; the real device takes its place on the wire.
 
-**Skip `Evil_EVSE_Evil_PEV` entirely** — don't create or start that
-container; your real device takes its place on the wire.
-
-**Skip SLAC in the containers.** Your real device is doing the
-interception (SLAC included), so `EVCC`/`SECC` running their own AcCCS
-SLAC step would be redundant. Both `secc_run_full.sh` and
-`evcc_run_full.sh` take an optional `noslac` argument that skips straight
-to the HLC step:
+**Skip SLAC in the containers.** Both `secc_run_full.sh` and
+`evcc_run_full.sh` take an optional `noslac` argument that skips the AcCCS
+SLAC step and goes straight to HLC — use it here, since SLAC is your own
+setup's job, not this container's:
 
 ```bash
 # SECC
@@ -559,6 +497,49 @@ docker exec -it EVCC bash -c "/usr/src/app/evcc_run_full.sh noslac"
 three containers including the Docker proxy — so drive `SECC`/`EVCC`
 manually as above, same pattern as the "run each step manually" steps in
 [Running it](#running-it).
+
+**Build and run the proxy software on the MITM device itself** (building
+there, rather than cross-compiling, so Docker picks the right base image
+automatically):
+
+```bash
+git clone git@github.com:securityinmobility/evexchange-mitm.git
+cd evexchange-mitm
+docker build -f docker/Dockerfile.proxytest -t proxy-proxy .
+```
+
+Run just `proxy01.py` — not `proxy_run_full.sh`, which also runs the AcCCS
+SLAC roles that aren't needed here — with the container sharing the
+device's real network stack (`--network host`) so it can see the two
+physical interfaces directly, and tell it which interface faces which side
+by name instead of by Docker subnet (`--secc-iface`/`--evcc-iface` — see
+`proxy01.py`'s `discover_secc_evcc_interfaces()`; auto-detect-by-subnet is
+what the rest of this README's Docker demo uses, and doesn't apply here
+since these are real interfaces, not `proxy_net1`/`proxy_net2`):
+
+```bash
+docker run -dit --network host --name Evil_EVSE_Evil_PEV proxy-proxy /bin/bash
+docker cp proxy/proxy01.py Evil_EVSE_Evil_PEV:/usr/src/app/iso15118/proxy01.py
+docker exec -it Evil_EVSE_Evil_PEV bash -c \
+  "cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex \
+     --secc-iface eth0 --evcc-iface eth1"
+```
+
+Replace `eth0`/`eth1` with whatever `ip -br a` on the device actually shows
+for the two links. `--tamper`, `--debug`, `--capture`, `--show-hex` all
+work the same as in the Docker demo (see
+[Content tampering](#content-tampering) above) — nothing about the
+relay/tamper/decode logic changed, only how the two interfaces are
+identified.
+
+**What this doesn't assume**: `proxy01.py` only needs to speak standard
+ISO 15118 SDP (UDP multicast to `ff02::1`, port `15118`) and TCP/TLS/EXI on
+the wire — it has no dependency on `SECC`/`EVCC` running any particular
+software beyond that, Dockerized or not. It does still import
+`iso15118.shared.exificient_exi_codec` at startup for EXI decode/encode
+(used by `--debug`/`--tamper`), which is why it still needs to run from
+inside the `proxy-proxy` image (or any environment with that package
+installed) even in this HLC-only mode.
 
 ## Repo layout
 
