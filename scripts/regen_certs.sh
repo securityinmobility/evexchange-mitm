@@ -15,7 +15,7 @@
 # Usage: ./regen_certs.sh
 set -euo pipefail
 
-PKI_REL="iso15118/shared/pki/iso15118_2"
+PKI_REL="iso15118/iso15118/shared/pki/iso15118_2"
 
 echo "--- Regenerating certs inside SECC ---"
 docker exec SECC bash -c "cd /usr/src/app/iso15118/iso15118/shared/pki && ./create_certs.sh -v iso-2"
