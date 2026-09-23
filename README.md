@@ -486,13 +486,79 @@ two interfaces are identified.
 
 **What this doesn't assume**: `proxy01.py` only needs to speak standard
 ISO 15118 SDP (UDP multicast to `ff02::1`, port `15118`) and TCP/TLS/EXI on
-the wire —
-it has no dependency on the real EVCC/SECC hardware running the same EcoG
-`iso15118` stack this repo's Docker demo uses. It does still import
-`iso15118.shared.exificient_exi_codec` at startup for EXI decode/encode
-(used by `--debug`/`--tamper`), which is why it still needs to run from
-inside the `proxy-proxy` image (or any environment with that package
-installed) even in this HLC-only mode.
+the wire — it has no dependency on the real EVCC/SECC hardware running the
+same EcoG `iso15118` stack this repo's Docker demo uses. It does still
+import `iso15118.shared.exificient_exi_codec` at startup for EXI
+decode/encode (used by `--debug`/`--tamper`), which is why it still needs
+to run from inside the `proxy-proxy` image (or any environment with that
+package installed) even in this HLC-only mode.
+
+## Bringing your own MITM hardware (EVCC/SECC stay Dockerized)
+
+This is the opposite combination from the section above: here, `EVCC` and
+`SECC` stay exactly as the rest of this README builds them — Docker
+containers doing SLAC + HLC via AcCCS/EcoG — but the MITM itself is a real
+device you already have, sitting in for the `Evil_EVSE_Evil_PEV` container
+instead of running it. Use this when the interception hardware is a given
+and you just need `EVCC`/`SECC` to be real ISO 15118 endpoints for it to
+sit between.
+
+**Topology.** Same "two separate physical links, no shared switch" reasoning
+as [Topology](#topology) above — a shared switch lets `EVCC` and `SECC`
+reach each other directly and bypasses whatever's intercepting — except now
+it's the Docker *host's* two NICs standing in for the proxy container's two
+interfaces, cabled out to your MITM device's two NICs:
+
+```
+EVCC container  ──(host NIC A)── real MITM device ──(host NIC B)──  SECC container
+```
+
+**Expose `proxy_net1`/`proxy_net2` to those NICs.** Docker bridge networks
+(what the rest of this README uses) are host-internal and never reach a
+real wire. Recreate them as `macvlan` networks instead, each bound to one
+of the host's physical NICs via `-o parent=`, keeping the same subnets so
+nothing else in the repo needs to change:
+
+```bash
+docker network create -d macvlan --ipv6 \
+  --subnet 172.20.0.0/16 --subnet 2001:db8:1::/64 \
+  -o parent=<host NIC facing SECC>   proxy_net1
+
+docker network create -d macvlan --ipv6 \
+  --subnet 172.19.0.0/16 --subnet 2001:db8:2::/64 \
+  -o parent=<host NIC facing EVCC>   proxy_net2
+```
+
+Replace the `<...>` placeholders with your actual NIC names (`ip -br a` on
+the host). If the host's real LAN already uses `172.19.0.0/16`/
+`172.20.0.0/16`, pick different subnets for both `docker network create`
+calls here and for the `resolve_iface()` prefixes in
+`secc_run_full.sh`/`evcc_run_full.sh` — otherwise interface auto-detection
+won't match. **Untested here** (no multi-NIC hardware to verify against) —
+try this against your actual host before relying on it for a live
+demonstration.
+
+**Skip `Evil_EVSE_Evil_PEV` entirely** — don't create or start that
+container; your real device takes its place on the wire.
+
+**Skip SLAC in the containers.** Your real device is doing the
+interception (SLAC included), so `EVCC`/`SECC` running their own AcCCS
+SLAC step would be redundant. Both `secc_run_full.sh` and
+`evcc_run_full.sh` take an optional `noslac` argument that skips straight
+to the HLC step:
+
+```bash
+# SECC
+docker exec -it SECC bash -c "/usr/src/app/secc_run_full.sh noslac"
+
+# EVCC (tls/PnC by default; set EVCC_MODE=notls same as normal)
+docker exec -it EVCC bash -c "/usr/src/app/evcc_run_full.sh noslac"
+```
+
+`run_full_demo.sh`/`run_live_demo.sh` don't apply here — they assume all
+three containers including the Docker proxy — so drive `SECC`/`EVCC`
+manually as above, same pattern as the "run each step manually" steps in
+[Running it](#running-it).
 
 ## Repo layout
 
