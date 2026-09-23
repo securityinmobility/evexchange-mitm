@@ -112,14 +112,11 @@ echo "=== Live run $TS (mode: $MODE${TAMPER_ARG:+, $TAMPER_ARG}) ==="
 echo "--- Ensuring containers are up ---"
 docker start EVCC SECC Evil_EVSE_Evil_PEV >/dev/null
 
-echo "--- Ensuring slac_net exists and EVCC/SECC are attached to it ---"
-docker network create --ipv6 --subnet 2001:db8:3::/64 slac_net >/dev/null 2>&1 || true
-docker network connect slac_net EVCC >/dev/null 2>&1 || true
-docker network connect slac_net SECC >/dev/null 2>&1 || true
-
 echo "--- Cleaning up any leftover processes from a previous run ---"
 docker exec Evil_EVSE_Evil_PEV pkill -x tcpdump 2>/dev/null
 docker exec Evil_EVSE_Evil_PEV pkill -f proxy01.py 2>/dev/null
+docker exec Evil_EVSE_Evil_PEV pkill -f "mod_acccs/EVSE.py" 2>/dev/null
+docker exec Evil_EVSE_Evil_PEV pkill -f "mod_acccs/PEV.py" 2>/dev/null
 docker exec SECC pkill -x tcpdump 2>/dev/null
 docker exec SECC pkill -f "iso15118/secc/main.py" 2>/dev/null
 docker exec SECC pkill -f "mod_acccs/EVSE.py" 2>/dev/null
@@ -150,8 +147,8 @@ docker exec EVCC tail -F -n +1 "/tmp/evcc_demo_${RUN_TAG}_${TS}.log" 2>/dev/null
     | sed -u "s/^/${C_EVCC}[EVCC]${C_RESET}  /" &
 sleep 0.5
 
-echo "--- Starting proxy (SDP/TCP relay) ---"
-docker exec -d "${PROXY_ENV_ARGS[@]}" Evil_EVSE_Evil_PEV bash -c "cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex > /tmp/proxy_demo_${RUN_TAG}_${TS}.log 2>&1"
+echo "--- Starting proxy (SLAC, both roles, then SDP/TCP relay) ---"
+docker exec -d "${PROXY_ENV_ARGS[@]}" Evil_EVSE_Evil_PEV bash -c "/usr/src/app/proxy_run_full.sh > /tmp/proxy_demo_${RUN_TAG}_${TS}.log 2>&1"
 sleep 2
 
 echo "--- Starting SECC (SLAC then HLC) ---"

@@ -1,13 +1,16 @@
 # evexchange-mitm
 
 A working man-in-the-middle setup between an ISO 15118 EVCC (EV / car side) and
-SECC (charger side), fully virtualized in Docker. EVCC and SECC first complete
-a real SLAC (HomePlug GreenPHY) link-establishment handshake directly with each
-other over a dedicated shared segment, then the proxy hijacks the SDP (SECC
+SECC (charger side), fully virtualized in Docker. The proxy sits in the middle
+at **both** layers: it completes its own SLAC (HomePlug GreenPHY)
+link-establishment handshake with each real endpoint (impersonating the SECC
+to the real EVCC, and the EVCC to the real SECC), then hijacks the SDP (SECC
 Discovery Protocol) handshake at the HLC layer so the EVCC connects to it
 instead of the real charger, and transparently relays the rest of the charging
 session — TCP/TLS and EXI-encoded ISO 15118-2 messages — including a real
-Plug & Charge TLS handshake with a full certificate chain.
+Plug & Charge TLS handshake with a full certificate chain. EVCC and SECC never
+share a network segment at either layer — every step of the session, from
+SLAC onward, only ever reaches the other side through the proxy.
 
 > **Research use only.** This repo intercepts and relays ISO 15118 charging
 > sessions between EV and EVSE. Use it only against your own test rigs /
@@ -29,17 +32,30 @@ Two independent layers, both virtualized as Docker containers:
   — via [EcoG's `iso15118`](https://github.com/EcoG-io/iso15118) stack, real
   EVCC and SECC implementations.
 
-SLAC and HLC run over **different network segments** in this setup, and are
-not chained (see [Topology](#topology) below): each container runs its SLAC
-step first, then unconditionally starts its HLC process regardless of the
-SLAC outcome (the bounded `timeout` in each `*_run_full.sh` is just a safety
-net). In practice, with the shared `slac_net` segment in place, SLAC now
-genuinely completes — real `CM_SLAC_PARM.REQ`/`CNF`, `CM_MNBC_SOUND.IND`
-rounds, `CM_ATTEN_CHAR.IND`/`RSP`, and `CM_SLAC_MATCH.REQ`/`CNF` between the
-two containers, not just one-way broadcasts. The proxy is not on `slac_net`
-and never sees this exchange — it only ever operates at the HLC layer.
+SLAC and HLC are not chained within a single container process (see
+[Topology](#topology) below): each container runs its SLAC step first, then
+unconditionally starts its HLC process regardless of the SLAC outcome (the
+bounded `timeout` in each `*_run_full.sh` is just a safety net). But at the
+network layer, both now run over `proxy_net1`/`proxy_net2` — the same two
+segments used for HLC — with the proxy present on both, so both layers are
+intercepted:
 
-The MITM proxy (`proxy/proxy01.py`) sits at the HLC layer only: it intercepts
+- **SLAC**: the proxy (`scripts/proxy_run_full.sh`) runs two AcCCS
+  `SLAC_ONLY=1` instances of its own, concurrently — a `PEV.py` (PEV role) on
+  its `proxy_net1` leg, facing the real `SECC`, and an `EVSE.py` (EVSE role)
+  on its `proxy_net2` leg, facing the real `EVCC`. Each is a genuine,
+  protocol-conformant handshake (real `CM_SLAC_PARM.REQ`/`CNF`,
+  `CM_MNBC_SOUND.IND` rounds, `CM_ATTEN_CHAR.IND`/`RSP`, and
+  `CM_SLAC_MATCH.REQ`/`CNF`) — the real `SECC`/`EVCC` each believe they
+  completed SLAC with each other, when they actually each completed it with
+  the proxy impersonating the other side. This mirrors the identity-swap
+  pattern in AcCCS's own `MIM.py` reference class, just invoked as two plain
+  `EVSE.py`/`PEV.py` processes (same as `secc_run_full.sh`/`evcc_run_full.sh`
+  already do) rather than `MIM.py` itself, which is stale against this fork's
+  `argparse`-based `EVSE`/`PEV` constructors.
+- **HLC**: unchanged — see below.
+
+The MITM proxy (`proxy/proxy01.py`) handles the HLC layer: it intercepts
 the EVCC's SDP multicast request, learns the real SECC's address from the
 SECC's own SDP response, rewrites that response so the EVCC connects to the
 proxy instead, opens its own connection to the real SECC, and relays
@@ -50,36 +66,39 @@ plaintext sessions via `--debug`.
 
 ## Topology
 
-Two independent networks, on two different interfaces of `EVCC` and `SECC`:
+Just two networks — `EVCC` and `SECC` each have a single interface, and never
+share a segment with each other at any layer:
 
 ```
-                         slac_net (shared L2 segment for real SLAC)
-              ┌──────────────────────────────────────────────────────┐
-              │                                                      │
    EVCC container                                             SECC container
  (EcoG iso15118 EVCC,                                       (EcoG iso15118 SECC,
    AcCCS PEV role)                                             AcCCS EVSE role)
              ─────────── proxy_net2 ───────────         ─────── proxy_net1 ───────
                                         proxy container
-                                (proxy01.py — SDP hijack
-                                  + transparent HLC relay)
+                        (proxy_run_full.sh — AcCCS EVSE role vs. EVCC,
+                          AcCCS PEV role vs. SECC, then proxy01.py —
+                                SDP hijack + transparent HLC relay)
 ```
 
-- `proxy_net1`: `172.20.0.0/16`, `2001:db8:1::/64` — SECC's HLC-facing network.
-- `proxy_net2`: `172.19.0.0/16`, `2001:db8:2::/64` — EVCC's HLC-facing network.
-- `slac_net`: `172.18.0.0/16`, `2001:db8:3::/64` — a plain shared segment for
-  `EVCC` and `SECC` only (the proxy is **not** on it). AcCCS's `PEV.py`/
-  `EVSE.py` require a link-local IPv6 address on the interface they're given
-  at startup, so `slac_net` must be created with `--ipv6` (a plain `docker
-  network create slac_net` without it leaves the interface IPv4-only and
-  AcCCS crashes immediately with `IndexError: list index out of range`).
-- At the HLC layer, `EVCC` and `SECC` are **still never on the same
-  network** — they can only reach each other through the proxy, which is the
-  only container on both `proxy_net1` and `proxy_net2`:
-  - `SECC` → `proxy_net1` + `slac_net`
-  - `EVCC` → `proxy_net2` + `slac_net`
-  - `Evil_EVSE_Evil_PEV` (the proxy) → `proxy_net1` + `proxy_net2`, not on
-    `slac_net` at all
+- `proxy_net1`: `172.20.0.0/16`, `2001:db8:1::/64` — SECC's network, carrying
+  both its SLAC and HLC traffic.
+- `proxy_net2`: `172.19.0.0/16`, `2001:db8:2::/64` — EVCC's network, same.
+  Both are created with `--ipv6` — AcCCS's `PEV.py`/`EVSE.py` require a
+  link-local IPv6 address on the interface they're given at startup (without
+  it, AcCCS crashes immediately with `IndexError: list index out of range`),
+  which `--ipv6` already satisfies for both networks.
+- `EVCC` and `SECC` are **never on the same network, at any layer** — they
+  can only reach each other through the proxy, which is the only container on
+  both `proxy_net1` and `proxy_net2`:
+  - `SECC` → `proxy_net1` only
+  - `EVCC` → `proxy_net2` only
+  - `Evil_EVSE_Evil_PEV` (the proxy) → `proxy_net1` + `proxy_net2`
+
+SLAC frames (HomePlug GreenPHY, EtherType `0x88E1`) and HLC traffic (SDP/UDP,
+TCP/TLS — both IP-based) coexist on the same two bridges without interfering:
+scapy's raw `AF_PACKET` SLAC handlers only ever see/inject `0x88E1` frames,
+completely independent of the UDP/TCP sockets `proxy01.py` has open on the
+same interfaces.
 
 **Nothing in this repo assumes `eth0`/`eth1` map to a particular network.**
 Docker does not guarantee that mapping stays stable across container
@@ -92,19 +111,21 @@ practice, in two different places:
   `proxy/proxy01.py` for the implementation), and pins the SDP multicast
   relay's outgoing interface the same way (`IPV6_MULTICAST_IF`) instead of
   trusting the kernel's default-route pick.
-- `secc_run_full.sh`/`evcc_run_full.sh` do the same for their own two
-  interfaces: a `resolve_iface()` shell function greps `ip -br a` for the
-  interface whose address falls in `slac_net`'s subnet (used for the AcCCS
-  SLAC step, `-I <iface>`) vs. the container's own HLC-facing subnet
-  (`proxy_net1` for SECC, `proxy_net2` for EVCC — passed to the EcoG stack
-  via the `NETWORK_INTERFACE` env var it already reads, rather than left to
-  its `eth0` default). This was hit for real: `SECC` ended up with
-  `slac_net` on `eth0` and `proxy_net1` on `eth1` after some earlier
-  reconnects, and since the HLC step never set `NETWORK_INTERFACE`, EcoG's
-  default of `eth0` silently pointed the SDP listener at `slac_net` instead
-  of `proxy_net1` — the proxy's SDP relay had a real destination, SECC's
-  listener was real too, they were just on two different networks, so every
-  run failed with `No SDP response from SECC`.
+- `secc_run_full.sh`/`evcc_run_full.sh`/`proxy_run_full.sh` all use the same
+  `resolve_iface()` shell function, which greps `ip -br a` for the interface
+  whose address falls in a given subnet (`proxy_net1` for SECC/the proxy's
+  SECC-facing leg, `proxy_net2` for EVCC/the proxy's EVCC-facing leg),
+  passed to AcCCS's `-I <iface>` and to the EcoG stack via the
+  `NETWORK_INTERFACE` env var it already reads, rather than left to its
+  `eth0` default. This was hit for real (back when SLAC ran on a separate
+  `slac_net` segment): `SECC` ended up with that segment on `eth0` and
+  `proxy_net1` on `eth1` after some earlier reconnects, and since the HLC
+  step never set `NETWORK_INTERFACE`, EcoG's default of `eth0` silently
+  pointed the SDP listener at the wrong network — the proxy's SDP relay had
+  a real destination, SECC's listener was real too, they were just on two
+  different networks, so every run failed with `No SDP response from SECC`.
+  Resolving every interface by subnet, everywhere, is what makes that class
+  of bug impossible regardless of how many networks are in play.
 
 ## Prerequisites
 
@@ -156,7 +177,6 @@ stale without re-verification is barely better than no pin.
 # Networks
 docker network create --ipv6 --subnet 172.20.0.0/16 --subnet 2001:db8:1::/64 proxy_net1
 docker network create --ipv6 --subnet 172.19.0.0/16 --subnet 2001:db8:2::/64 proxy_net2
-docker network create --ipv6 --subnet 2001:db8:3::/64 slac_net   # must be --ipv6, see Topology
 
 # Containers (no extra --cap-add needed — Docker's default caps already
 # include NET_RAW, enough for both AcCCS's raw SLAC sockets and tcpdump)
@@ -164,13 +184,13 @@ docker run -dit --network proxy_net1 --name SECC proxy-proxy /bin/bash
 docker run -dit --network proxy_net2 --name EVCC proxy-proxy /bin/bash
 docker run -dit --network proxy_net1 --name Evil_EVSE_Evil_PEV proxy-proxy /bin/bash
 docker network connect proxy_net2 Evil_EVSE_Evil_PEV   # dual-home the proxy
-docker network connect slac_net SECC   # SECC's second network, for real SLAC
-docker network connect slac_net EVCC   # EVCC's second network, for real SLAC
 
 # Copy this repo's scripts into each container
 docker cp proxy/proxy01.py            Evil_EVSE_Evil_PEV:/usr/src/app/iso15118/proxy01.py
+docker cp scripts/proxy_run_full.sh   Evil_EVSE_Evil_PEV:/usr/src/app/proxy_run_full.sh
 docker cp scripts/secc_run_full.sh    SECC:/usr/src/app/secc_run_full.sh
 docker cp scripts/evcc_run_full.sh    EVCC:/usr/src/app/evcc_run_full.sh
+docker exec Evil_EVSE_Evil_PEV chmod +x /usr/src/app/proxy_run_full.sh
 docker exec SECC chmod +x /usr/src/app/secc_run_full.sh
 docker exec EVCC chmod +x /usr/src/app/evcc_run_full.sh
 
@@ -189,23 +209,21 @@ packets, and copies the results back to the host:
 ./scripts/run_full_demo.sh notls tamper    # plaintext + live content tampering — see "Content tampering"
 ```
 
-This starts all three containers, ensures `slac_net` exists and `EVCC`/`SECC`
-are attached to it (idempotent, safe to re-run), launches `tcpdump -i any`
-inside the proxy (the only container that sees *both* legs of the HLC relay
-in one capture) plus per-leg captures on `SECC`/`EVCC` (which also pick up
-the real SLAC exchange on `slac_net`, since the proxy never sees it), runs
-`proxy01.py --capture --show-hex`, then `secc_run_full.sh` and
-`evcc_run_full.sh` in sequence, waits for the HLC session to actually finish,
-stops all captures cleanly (`SIGINT`, so the pcap trailer is written
-properly), and drops everything into `captures/` on the host, timestamped so
-repeated runs never clobber each other:
+This starts all three containers, launches `tcpdump -i any` inside the proxy
+(the only container that sees *both* legs, SLAC and HLC alike, in one
+capture) plus per-leg captures on `SECC`/`EVCC`, runs `proxy_run_full.sh`
+(the proxy's two SLAC roles, then `proxy01.py --capture --show-hex`), then
+`secc_run_full.sh` and `evcc_run_full.sh` in sequence, waits for the HLC
+session to actually finish, stops all captures cleanly (`SIGINT`, so the pcap
+trailer is written properly), and drops everything into `captures/` on the
+host, timestamped so repeated runs never clobber each other:
 
 ```
 captures/
-  full_run_<mode>_<ts>.pcap    # proxy's view — both HLC relay legs, the authoritative HLC capture
-  secc_run_<mode>_<ts>.pcap    # SECC's own HLC leg + the real SLAC handshake on slac_net
-  evcc_run_<mode>_<ts>.pcap    # EVCC's own HLC leg + the real SLAC handshake on slac_net
-  proxy_demo_<mode>_<ts>.log   # proxy01.py's relay/decode log
+  full_run_<mode>_<ts>.pcap    # proxy's view — SLAC (both roles) + both HLC relay legs, the authoritative capture
+  secc_run_<mode>_<ts>.pcap    # SECC's own SLAC + HLC leg (now against the proxy, not EVCC directly)
+  evcc_run_<mode>_<ts>.pcap    # EVCC's own SLAC + HLC leg (now against the proxy, not SECC directly)
+  proxy_demo_<mode>_<ts>.log   # proxy_run_full.sh's SLAC output + proxy01.py's relay/decode log
   secc_demo_<mode>_<ts>.log    # SECC-side SLAC + HLC stdout
   evcc_demo_<mode>_<ts>.log    # EVCC-side SLAC + HLC stdout
 ```
@@ -213,9 +231,9 @@ captures/
 Or run each step manually, one shell per container:
 
 ```bash
-# 1. Proxy
+# 1. Proxy (SLAC, both roles, then SDP/TCP relay)
 docker exec -it Evil_EVSE_Evil_PEV bash
-cd /usr/src/app/iso15118 && python3 proxy01.py --capture --show-hex
+/usr/src/app/proxy_run_full.sh
 
 # 2. SECC (wait for the proxy to be listening)
 docker exec -it SECC bash
@@ -248,11 +266,13 @@ can follow SLAC happening on both sides, then the SDP hijack, then the
 TLS handshake or plaintext EXI messages, in the order they actually occur:
 
 ```
+[PROXY] INFO (PEV) : Starting SLAC
 [SECC]  INFO (EVSE): Recieved SLAC_PARM_REQ
 [SECC]  INFO (EVSE): Sending CM_SLAC_PARM_CNF
-[EVCC]  INFO (PEV) : Sending 10 MNBC_SOUND_IND
+[PROXY] INFO (EVSE): Sending 10 MNBC_SOUND_IND
 [SECC]  INFO (EVSE): Sending SLAC_MATCH_CNF
 [SECC]  INFO (EVSE): Done SLAC
+[PROXY] INFO (PEV) : Done SLAC
 [EVCC]  INFO (PEV) : Done SLAC
 [PROXY] SECC SDP Response: 01fe900100000014fe800000000000006c57defffecc1954edcf0000
 [PROXY]   SECC IP: fe80::6c57:deff:fecc:1954
@@ -296,8 +316,8 @@ reads an `EVCC_MODE` env var (`tls` by default) and picks
 `docker exec -e EVCC_MODE=... EVCC ...`. `SECC` needs no corresponding
 change — it already advertises both `EIM` and `PNC` auth modes and follows
 whatever the EVCC's SDP request asks for, so `secc_run_full.sh` is identical
-in both modes. The SLAC step (now on `slac_net`, see [Topology](#topology))
-is also identical in both modes.
+in both modes. The SLAC step (see [Topology](#topology)) is also identical
+in both modes.
 
 `tls` mode negotiates a real TLS handshake with a full cert chain
 (`CPOSubCA2 → SECCCert`, `CPOSubCA2 → CPOSubCA1 → V2GRootCA`). `notls` mode
@@ -323,11 +343,14 @@ Example captures from a single, real run are included in
   relay/decode log for that same run — 45 relayed messages,
   `SupportedAppProtocol` through `SessionStop`): the HLC/TLS side, captured
   on the proxy.
-- `secc_run_slac_handshake.pcap` and `secc_demo_slac_handshake.log`: the real
-  SLAC handshake from the same run, captured on `SECC`'s `slac_net`
-  interface — `CM_SET_KEY.REQ` → `CM_SLAC_PARM.REQ`/`CNF` → `CM_START_ATTEN_CHAR.IND` →
-  repeated `CM_MNBC_SOUND.IND` → `CM_ATTEN_CHAR.IND`/`RSP` →
-  `CM_SLAC_MATCH.REQ`/`CNF`, ending in `EVSE: Done SLAC`.
+- `secc_run_slac_handshake.pcap` and `secc_demo_slac_handshake.log`: the SLAC
+  handshake from the same run — `CM_SET_KEY.REQ` → `CM_SLAC_PARM.REQ`/`CNF` →
+  `CM_START_ATTEN_CHAR.IND` → repeated `CM_MNBC_SOUND.IND` →
+  `CM_ATTEN_CHAR.IND`/`RSP` → `CM_SLAC_MATCH.REQ`/`CNF`, ending in
+  `EVSE: Done SLAC`. Captured on `SECC`'s dedicated `slac_net` interface from
+  before the proxy also intercepted SLAC (see [Topology](#topology)) — SECC's
+  SLAC counterpart in this particular capture is the real `EVCC`, not the
+  proxy; the message sequence itself is unchanged.
 
 ### Certificate expiry
 
@@ -411,10 +434,11 @@ and `evcc_demo_tamper.log` (shows EVCC decoding the tampered `63A` value).
 
 ```
 docker/Dockerfile.proxytest  Builds the proxy-proxy image (iso15118 + mod_acccs + HomePlugPWN/V2GInjector)
-proxy/proxy01.py         The MITM relay (SDP hijack + transparent TCP/TLS relay)
-scripts/secc_run_full.sh  SLAC (AcCCS EVSE role) then HLC (EcoG SECC) in one command
-scripts/evcc_run_full.sh  SLAC (AcCCS PEV role) then HLC (EcoG EVCC, TLS/PnC) in one command
-scripts/run_full_demo.sh  Host-side orchestrator: sets up slac_net, runs everything + captures pcaps
+proxy/proxy01.py         The HLC MITM relay (SDP hijack + transparent TCP/TLS relay)
+scripts/proxy_run_full.sh SLAC (AcCCS, both roles, concurrently) then HLC (proxy01.py) in one command
+scripts/secc_run_full.sh  SLAC (AcCCS EVSE role, vs. the proxy) then HLC (EcoG SECC) in one command
+scripts/evcc_run_full.sh  SLAC (AcCCS PEV role, vs. the proxy) then HLC (EcoG EVCC, TLS/PnC) in one command
+scripts/run_full_demo.sh  Host-side orchestrator: runs everything + captures pcaps
 scripts/run_live_demo.sh  Same flow, streamed live/labeled to the terminal -- see "Live demo"
 scripts/regen_certs.sh    Regenerates the ISO 15118-2 PKI and syncs it SECC -> EVCC
 examples/                 Sample captures + logs from a working SLAC + TLS/PnC run
