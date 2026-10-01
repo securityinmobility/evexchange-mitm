@@ -27,9 +27,32 @@
 # something goes wrong we don't want this to block the HLC step forever.
 #
 # EVCC_MODE selects the HLC config: "tls" (default) negotiates a real
-# TLS/PnC session with a full cert chain; "notls" negotiates plaintext
-# EIM/AC. SECC needs no corresponding change -- it follows whatever the
-# EVCC's SDP request asks for.
+# ISO 15118-2 TLS/PnC session with a full cert chain; "notls" negotiates
+# ISO 15118-2 plaintext EIM/AC; "iso20" negotiates an ISO 15118-20 AC
+# session. SECC needs no corresponding change for any of these -- it
+# follows whatever the EVCC's SDP request/SupportedAppProtocol negotiation
+# asks for.
+#
+# NOTE: the ISO 15118-20 standard itself mandates TLS, but the pinned
+# iso15118 stack's own shipped example (evcc_config_ac.json, and in fact
+# all four of its iso15118_20/ example configs) sets "useTls": false --
+# "iso20" here therefore negotiates PLAINTEXT by default, same as "notls"
+# does for -2, not TLS. (Confirmed directly against the built image's
+# iso15118/shared/examples/evcc/iso15118_20/*.json -- not a guess.) This
+# means --debug/--tamper (on proxy01.py too, not just the split proxy) can
+# actually see -20 content in this default config; tamper itself still
+# no-ops since -20 uses a differently-named/shaped message
+# (ACChargeParameterDiscoveryRes, not ChargeParameterDiscoveryRes).
+#
+# To test a genuinely TLS-protected -20 session instead, point config= at
+# your own copy of evcc_config_ac.json with "useTls": true set, and
+# consider ENABLE_TLS_1_3=true (env var, read directly by the iso15118
+# stack -- see iso15118/shared/security.py's get_ssl_context()) for TLS
+# 1.3 + mutual-auth behavior (set it on SECC/Evil_SECC/Evil_EVCC too, via
+# docker-compose.yml's environment: blocks, not just here). Note: at this
+# pinned commit, TLS cert loading always reads the iso15118_2 PKI
+# directory regardless of protocol version (an upstream TODO, not
+# something this repo controls) -- so no separate cert sync is needed.
 set -uo pipefail
 
 EVCC_MODE="${EVCC_MODE:-tls}"
@@ -80,8 +103,12 @@ case "$EVCC_MODE" in
         echo "=== $HLC_STEP_LABEL EcoG iso15118 EVCC (HLC layer, plaintext EIM) on $HLC_IFACE (proxy_net2) ==="
         exec env NETWORK_INTERFACE="$HLC_IFACE" make run-evcc config=iso15118/shared/examples/evcc/iso15118_2/evcc_config_eim_ac.json
         ;;
+    iso20)
+        echo "=== $HLC_STEP_LABEL EcoG iso15118 EVCC (HLC layer, ISO 15118-20 AC) on $HLC_IFACE (proxy_net2) ==="
+        exec env NETWORK_INTERFACE="$HLC_IFACE" make run-evcc config=iso15118/shared/examples/evcc/iso15118_20/evcc_config_ac.json
+        ;;
     *)
-        echo "Unknown EVCC_MODE '$EVCC_MODE' (expected 'tls' or 'notls')" >&2
+        echo "Unknown EVCC_MODE '$EVCC_MODE' (expected 'tls', 'notls', or 'iso20')" >&2
         exit 1
         ;;
 esac

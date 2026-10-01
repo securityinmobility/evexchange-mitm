@@ -1,5 +1,6 @@
-# One-time setup, compose form. Replaces the network create / docker run /
-# docker cp block in the README's "One-time setup" section.
+# Primary way to run this repo -- see README "Quick start". Replaces the
+# network create / docker run / docker cp block in the README's manual
+# setup section (kept there as a documented fallback, not the main path).
 #
 # `command:` on each service also rebuilds what run_live_demo.sh used to do
 # from the host via `docker exec` (see scripts/compose_*_entry.sh) -- so
@@ -15,6 +16,15 @@
 #                                                       # effect in notls
 #   ./scripts/regen_certs.sh   # still separate: it execs create_certs.sh
 #                               # inside SECC, not a static file copy
+#
+#   # ISO 15118-20 (split profile only -- see README "Split proxy"):
+#   EVCC_MODE=iso20 docker compose --profile split up --build \
+#     SECC EVCC Evil_SECC Evil_EVCC
+#   # Runs plaintext by default (the pinned iso15118 stack's own -20
+#   # example config sets useTls: false -- not something this repo
+#   # controls). ENABLE_TLS_1_3=true (set here so it reaches all four
+#   # services below) plus your own useTls:true config would be needed for
+#   # a genuinely TLS-protected -20 run -- see README for the full story.
 #
 # Pcaps/logs land directly in ./captures on the host (bind-mounted), so no
 # docker cp step is needed afterwards either.
@@ -38,6 +48,8 @@ services:
     tty: true
     stdin_open: true
     command: /usr/src/app/compose_secc_entry.sh
+    environment:
+      ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- see EVCC_MODE=iso20 below
     networks:
       - proxy_net1
     volumes:
@@ -53,7 +65,10 @@ services:
     stdin_open: true
     command: /usr/src/app/compose_evcc_entry.sh
     environment:
-      EVCC_MODE: ${EVCC_MODE:-tls}   # tls (default) or notls
+      EVCC_MODE: ${EVCC_MODE:-tls}   # tls (default), notls, or iso20
+      ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- genuine TLS 1.3 +
+                                             # mutual-auth -20 behavior; set
+                                             # on SECC/Evil_SECC/Evil_EVCC too
     networks:
       - proxy_net2
     volumes:
@@ -75,8 +90,59 @@ services:
       - proxy_net2
     volumes:
       - ./proxy/proxy01.py:/usr/src/app/iso15118/proxy01.py:ro
+      - ./proxy/common.py:/usr/src/app/iso15118/common.py:ro
       - ./scripts/proxy_run_full.sh:/usr/src/app/proxy_run_full.sh:ro
       - ./scripts/compose_proxy_entry.sh:/usr/src/app/compose_proxy_entry.sh:ro
+      - ./captures:/captures
+
+  # --- "split" profile: the two-fake-endpoint MITM (Evil_SECC + Evil_EVCC),
+  # an alternative to Evil_EVSE_Evil_PEV above -- not started by a plain
+  # `docker compose up` (no profiles: key there), only via
+  # `docker compose --profile split up SECC EVCC Evil_SECC Evil_EVCC`.
+  # See README "Split proxy (Evil_SECC + Evil_EVCC)". Don't run this
+  # alongside Evil_EVSE_Evil_PEV against the same SECC/EVCC -- both would
+  # try to answer the same SDP/SLAC requests.
+  Evil_SECC:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: Evil_SECC
+    tty: true
+    stdin_open: true
+    profiles: ["split"]
+    command: /usr/src/app/compose_evil_secc_entry.sh
+    environment:
+      ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- see EVCC_MODE=iso20 on EVCC
+    networks:        # proxy_net2 (EVCC-facing) + bridge_net (Evil_EVCC only)
+      - proxy_net2
+      - bridge_net
+    volumes:
+      - ./proxy/evil_secc.py:/usr/src/app/iso15118/evil_secc.py:ro
+      - ./proxy/common.py:/usr/src/app/iso15118/common.py:ro
+      - ./scripts/evil_secc_run_full.sh:/usr/src/app/evil_secc_run_full.sh:ro
+      - ./scripts/compose_evil_secc_entry.sh:/usr/src/app/compose_evil_secc_entry.sh:ro
+      - ./captures:/captures
+
+  Evil_EVCC:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: Evil_EVCC
+    tty: true
+    stdin_open: true
+    profiles: ["split"]
+    command: /usr/src/app/compose_evil_evcc_entry.sh
+    environment:
+      TAMPER: ${TAMPER:-}   # 1 = tamper EVSEMaxCurrent -- works in TLS/PnC
+                             # and ISO 15118-20 too here, unlike the
+                             # single-relay proxy's notls-only tamper.
+      ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- see EVCC_MODE=iso20 on EVCC
+    networks:        # proxy_net1 (SECC-facing) + bridge_net (Evil_SECC only)
+      - proxy_net1
+      - bridge_net
+    volumes:
+      - ./proxy/evil_evcc.py:/usr/src/app/iso15118/evil_evcc.py:ro
+      - ./proxy/common.py:/usr/src/app/iso15118/common.py:ro
+      - ./scripts/evil_evcc_run_full.sh:/usr/src/app/evil_evcc_run_full.sh:ro
+      - ./scripts/compose_evil_evcc_entry.sh:/usr/src/app/compose_evil_evcc_entry.sh:ro
       - ./captures:/captures
 
 networks:
@@ -95,3 +161,17 @@ networks:
       config:
         - subnet: 172.19.0.0/16
         - subnet: 2001:db8:2::/64
+
+  # Private control/data channel between Evil_SECC and Evil_EVCC only --
+  # neither real SECC nor real EVCC is ever attached to this network, same
+  # "never share a segment" property proxy_net1/proxy_net2 already have for
+  # the real endpoints. No IPv6/link-local requirement here (nothing
+  # HomePlug/SLAC-related crosses it, just the JSON control/relay protocol
+  # in proxy/common.py), and `internal: true` additionally blocks this
+  # network from reaching anything outside the Docker host.
+  bridge_net:
+    name: bridge_net
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24

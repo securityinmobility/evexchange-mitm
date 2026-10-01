@@ -4,15 +4,28 @@
 # captures packets throughout, on the host side, into timestamped pcaps.
 #
 # Usage:
-#   ./run_full_demo.sh [tls|notls] [tamper]
-#   tls   (default) -- EVCC negotiates a real TLS/PnC session with a full
-#                       certificate chain.
-#   notls           -- EVCC negotiates a plaintext EIM/AC session.
+#   ./run_full_demo.sh [tls|notls|iso20] [tamper]
+#   tls   (default) -- EVCC negotiates a real ISO 15118-2 TLS/PnC session
+#                       with a full certificate chain.
+#   notls           -- EVCC negotiates a plaintext ISO 15118-2 EIM/AC
+#                       session.
+#   iso20           -- EVCC negotiates an ISO 15118-20 AC session. The
+#                       shipped example config (evcc_config_ac.json) sets
+#                       useTls: false, so this actually runs PLAINTEXT by
+#                       default (same decode path as notls) -- this
+#                       proxy's EXI decode already covers -20's message
+#                       namespaces, so --debug works here. tamper does
+#                       NOT fire though: -20 uses a differently-shaped
+#                       ACChargeParameterDiscoveryRes, not the -2
+#                       ChargeParameterDiscoveryRes this proxy's tamper
+#                       logic targets.
 #   tamper          -- proxy tampers with EVSEMaxCurrent in
 #                       ChargeParameterDiscoveryRes (SECC->EVCC). Only takes
 #                       effect in notls mode -- see README "Content
 #                       tampering" section for why TLS can't be tampered
-#                       with by this proxy. Off by default.
+#                       with by this proxy (iso20 is plaintext here but
+#                       still has no effect, for the message-shape reason
+#                       above). Off by default.
 #
 # Requires: EVCC, SECC, Evil_EVSE_Evil_PEV containers already created
 # (docker create/run once, with proxy_net1/proxy_net2 attached as set up
@@ -21,14 +34,14 @@ set -uo pipefail
 
 MODE="${1:-tls}"
 case "$MODE" in
-    tls|notls) ;;
-    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
+    tls|notls|iso20) ;;
+    *) echo "Usage: $0 [tls|notls|iso20] [tamper]" >&2; exit 1 ;;
 esac
 
 TAMPER_ARG="${2:-}"
 case "$TAMPER_ARG" in
     ""|tamper) ;;
-    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [tls|notls|iso20] [tamper]" >&2; exit 1 ;;
 esac
 PROXY_ENV_ARGS=()
 RUN_TAG="$MODE"
@@ -39,6 +52,10 @@ if [ "$TAMPER_ARG" = "tamper" ]; then
         echo "NOTE: tamper has no effect in tls mode (the proxy can't see inside" >&2
         echo "      TLS-protected content) -- proceeding anyway, but expect no" >&2
         echo "      [TAMPER] line. Use './run_full_demo.sh notls tamper' to see it." >&2
+    elif [ "$MODE" = "iso20" ]; then
+        echo "NOTE: tamper targets ISO 15118-2's ChargeParameterDiscoveryRes --" >&2
+        echo "      -20 uses a differently-shaped ACChargeParameterDiscoveryRes, so" >&2
+        echo "      expect no [TAMPER] line even though iso20 runs plaintext here." >&2
     fi
 fi
 

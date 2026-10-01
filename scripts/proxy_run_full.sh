@@ -61,4 +61,10 @@ echo "=== proxy EVSE-role SLAC exited with code $? — proceeding to HLC regardl
 
 echo "=== [2/2] HLC MITM (proxy01.py) ==="
 cd /usr/src/app/iso15118
-exec python3 proxy01.py --capture --show-hex
+# /venv/bin/python3, not bare python3: proxy01.py (via common.py) imports
+# iso15118.shared.messages.enums, which needs pydantic -- only present in
+# /venv (where the iso15118 wheel's own dependencies were installed), not
+# the base image's system python3 (which only has what was bare `pip
+# install`-ed: environs/py4j/scapy/requests/tqdm, for mod_acccs's SLAC
+# step above, not this one).
+exec /venv/bin/python3 proxy01.py --capture --show-hex

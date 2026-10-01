@@ -6,10 +6,15 @@
 # the same pcap/log artifacts in captures/ at the end.
 #
 # Usage:
-#   ./run_live_demo.sh [tls|notls] [tamper]
-#   tls   (default) -- EVCC negotiates a real TLS/PnC session with a full
-#                       certificate chain.
-#   notls           -- EVCC negotiates a plaintext EIM/AC session.
+#   ./run_live_demo.sh [tls|notls|iso20] [tamper]
+#   tls   (default) -- EVCC negotiates a real ISO 15118-2 TLS/PnC session
+#                       with a full certificate chain.
+#   notls           -- EVCC negotiates a plaintext ISO 15118-2 EIM/AC
+#                       session.
+#   iso20           -- EVCC negotiates an ISO 15118-20 AC session. The
+#                       shipped example config sets useTls: false, so this
+#                       runs plaintext by default -- see run_full_demo.sh's
+#                       header comment for the full explanation.
 #   tamper          -- proxy tampers with EVSEMaxCurrent in
 #                       ChargeParameterDiscoveryRes (SECC->EVCC). Only takes
 #                       effect in notls mode -- see README "Content
@@ -25,14 +30,14 @@ set -uo pipefail
 
 MODE="${1:-tls}"
 case "$MODE" in
-    tls|notls) ;;
-    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
+    tls|notls|iso20) ;;
+    *) echo "Usage: $0 [tls|notls|iso20] [tamper]" >&2; exit 1 ;;
 esac
 
 TAMPER_ARG="${2:-}"
 case "$TAMPER_ARG" in
     ""|tamper) ;;
-    *) echo "Usage: $0 [tls|notls] [tamper]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [tls|notls|iso20] [tamper]" >&2; exit 1 ;;
 esac
 PROXY_ENV_ARGS=()
 RUN_TAG="$MODE"
@@ -41,6 +46,9 @@ if [ "$TAMPER_ARG" = "tamper" ]; then
     RUN_TAG="${MODE}_tamper"
     if [ "$MODE" = "tls" ]; then
         echo "NOTE: tamper has no effect in tls mode -- use 'notls tamper' to see it." >&2
+    elif [ "$MODE" = "iso20" ]; then
+        echo "NOTE: tamper targets -2's ChargeParameterDiscoveryRes, not -20's" >&2
+        echo "      differently-shaped ACChargeParameterDiscoveryRes -- no [TAMPER] line." >&2
     fi
 fi
 
