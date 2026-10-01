@@ -259,9 +259,19 @@ Don't run this alongside `Evil_EVSE_Evil_PEV` against the same `SECC`/
 `EVCC` — both would try to answer the same SDP/SLAC requests. Captures land
 in `./captures/` the same way (`evil_secc_run_*`/`evil_evcc_run_*`).
 
-**Limitations**: one real `EVCC`/`SECC` pair and one session at a time, not
-a general-purpose multi-session proxy. `--tamper` stays ISO 15118-2
-AC-specific here too.
+**Limitations**:
+- One real `EVCC`/`SECC` pair and one session at a time, not a
+  general-purpose multi-session proxy.
+- `--tamper` stays ISO 15118-2 AC-specific here too.
+- `bridge_net` carries the `Evil_SECC`↔`Evil_EVCC` control/relay protocol
+  in plain, unauthenticated JSON — it relies entirely on network isolation
+  (`internal: true`, no real EVCC/SECC ever attached) rather than being a
+  hardened channel in its own right.
+- Verified for one full session end to end (SDP → TLS handshake → relay →
+  `SessionStop`), not stress-tested for back-to-back sessions, concurrent
+  use, or recovery from a mid-session error.
+- Not adapted for the "[Real hardware](#real-hardware-hlc-only)" setup
+  below — that section only covers `proxy01.py`, the single relay.
 
 ## Real hardware (HLC-only)
 
