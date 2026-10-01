@@ -106,16 +106,28 @@ async def decode_with_fallback(codec, payload: bytes):
 # --------------------------------------------------------------------
 # Interface discovery
 # --------------------------------------------------------------------
-async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None):
+async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None,
+                                         secc_net_v4=None, secc_net_v6=None,
+                                         evcc_net_v4=None, evcc_net_v6=None):
     """
     Identify which local interface faces SECC's network (proxy_net1) and
     which faces EVCC's (proxy_net2).
 
     Default (secc_iface/evcc_iface both None): match each interface's
     actual assigned subnet (IPv4 and/or global IPv6) against the known
-    SECC_NET_*/EVCC_NET_* ranges. This is self-correcting regardless of
-    which order the interfaces were connected in -- it does not rely on
-    `ip a` listing order at all.
+    SECC_NET_*/EVCC_NET_* ranges (or secc_net_v4/v6, evcc_net_v4/v6, if
+    given -- see below). This is self-correcting regardless of which order
+    the interfaces were connected in -- it does not rely on `ip a` listing
+    order at all.
+
+    secc_net_v4/secc_net_v6/evcc_net_v4/evcc_net_v6: override which
+    ip_network ranges count as "secc"/"evcc" instead of the module-level
+    SECC_NET_*/EVCC_NET_* constants (proxy_net1/proxy_net2's subnets).
+    Needed when a caller sits on a different pair of networks entirely --
+    e.g. the EVExchange cross-relay's Dev2 (proxy/dev_relay.py), which
+    faces proxy_net3/proxy_net4, not proxy_net1/proxy_net2. Defaults
+    (None) keep today's behavior unchanged for proxy01.py/evil_secc.py/
+    evil_evcc.py, none of which pass these.
 
     If secc_iface/evcc_iface are given (--secc-iface/--evcc-iface on the
     CLI), match by interface name instead -- for real hardware, where the
@@ -125,6 +137,10 @@ async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None):
     Returns {"secc": (link_local_addr, scope_id), "evcc": (link_local_addr, scope_id)},
     with a role missing if no interface matched.
     """
+    secc_net_v4 = secc_net_v4 or SECC_NET_V4
+    secc_net_v6 = secc_net_v6 or SECC_NET_V6
+    evcc_net_v4 = evcc_net_v4 or EVCC_NET_V4
+    evcc_net_v6 = evcc_net_v6 or EVCC_NET_V6
     result = await asyncio.create_subprocess_shell('ip a', stdout=asyncio.subprocess.PIPE)
     stdout, _ = await result.communicate()
     lines = stdout.decode().splitlines()
@@ -171,13 +187,13 @@ async def discover_secc_evcc_interfaces(secc_iface=None, evcc_iface=None):
         v4 = addrs.get("v4")
         v6g = addrs.get("v6_global")
         try:
-            if v4 and ipaddress.ip_address(v4) in SECC_NET_V4:
+            if v4 and ipaddress.ip_address(v4) in secc_net_v4:
                 return "secc"
-            if v4 and ipaddress.ip_address(v4) in EVCC_NET_V4:
+            if v4 and ipaddress.ip_address(v4) in evcc_net_v4:
                 return "evcc"
-            if v6g and ipaddress.ip_address(v6g) in SECC_NET_V6:
+            if v6g and ipaddress.ip_address(v6g) in secc_net_v6:
                 return "secc"
-            if v6g and ipaddress.ip_address(v6g) in EVCC_NET_V6:
+            if v6g and ipaddress.ip_address(v6g) in evcc_net_v6:
                 return "evcc"
         except ValueError:
             pass

@@ -273,6 +273,113 @@ in `./captures/` the same way (`evil_secc_run_*`/`evil_evcc_run_*`).
 - Not adapted for the "[Real hardware](#real-hardware-hlc-only)" setup
   below — that section only covers `proxy01.py`, the single relay.
 
+## EVExchange cross-session relay
+
+Neither of the two modes above is actually the attack this repo is named
+after — both are single-session MITM designs. This section reproduces the
+actual **EVExchange** attack: Conti, Donadel, Poovendran & Turrin,
+*"EVExchange: A Relay Attack on Electric Vehicle Charging System"*
+(arXiv:2203.05266).
+
+### The scenario (what the paper describes)
+
+Two real EVs each plug into one of two real, independent chargers at the
+same site — both managed by the same back-end/charging network, so both
+sides already trust each other's Plug & Charge certificates. One EV
+belongs to a victim, one to the attacker. The attacker has pre-installed
+two small relay devices, one inline at each charger's connector, wired
+(or wirelessly linked) to each other.
+
+Once both EVs are plugged in, the two relay devices **swap which
+charger's communication each EV actually reaches** — the victim's EV ends
+up negotiating its charging session with the *attacker's* charger, and
+the attacker's EV ends up negotiating with the *victim's* charger. The
+physical power cables never move: each charger still only ever energizes
+whatever car is actually plugged into it. Since Plug & Charge bills
+whoever's certificate/identity is in the negotiated session — not
+whoever's car is physically drawing the current — the victim ends up
+billed for charging the attacker's car, while the attacker can cut their
+own (relayed) session short right after the victim walks away, paying
+almost nothing for the energy that went into the victim's car instead.
+
+Crucially, the relay devices **never decrypt anything** — the paper is
+explicit that they only need to stop/forward the byte stream, even when
+it's TLS-protected, since the attack works at the level of *which session
+reaches which charger*, not by reading or altering content.
+
+### How we reproduce it
+
+This maps directly onto the existing building blocks in this repo,
+blind-relay-only (no TLS termination anywhere, closer to `proxy01.py`'s
+opaque pass-through than to the split proxy's content-visible design,
+which exists for a different reason this attack doesn't need):
+
+```
+EVCC (victim) ──proxy_net2── Dev1 ──proxy_net1── SECC (victim's charger)
+                              │
+                         relay_link
+                      (two raw TCP pipes,
+                       Dev1<->Dev2 -- nothing
+                       is ever decoded)
+                              │
+EVCC_Attacker ──proxy_net4── Dev2 ──proxy_net3── SECC_Attacker (attacker's charger)
+```
+
+`Dev1`/`Dev2` (`proxy/dev_relay.py`, one shared script) are mirror images
+of each other, each a three-homed blind relay: a local-EVCC leg (SDP
+responder, reusing the same SDP construction `evil_secc.py` uses), a
+local-SECC leg (SDP initiator, same as `evil_evcc.py`), and a `relay_link`
+connection to the other Dev. **The cross-wire**: each Dev's local-EVCC leg
+bytes go out to the *other* Dev over `relay_link`, not back to its own
+local-SECC leg — so `EVCC`'s (victim's) session actually reaches
+`SECC_Attacker`, and `EVCC_Attacker`'s session actually reaches `SECC`
+(victim's charger), while each charger's cable still only ever energizes
+whatever's physically plugged into it. That data/energy split *is* the
+attack — no decode or tamper logic exists anywhere in `dev_relay.py`.
+
+`SECC_Attacker` needs the exact same cert chain as `SECC` (so the
+cross-wired TLS handshake — victim's `EVCC` ending up talking to
+`SECC_Attacker` — actually validates); `scripts/regen_certs.sh` already
+syncs to it if present. `Dev1`/`Dev2` themselves need no certs at all,
+since they never terminate TLS.
+
+```bash
+docker compose --profile evexchange up --build \
+  SECC EVCC SECC_Attacker EVCC_Attacker Dev1 Dev2
+```
+
+Confirm the cross-wire actually happened by checking **identity, not just
+traffic**: `SECC`'s own HLC log should show a session authenticated as the
+*attacker's* contract cert, and `SECC_Attacker`'s log should show the
+*victim's* — that mismatch between which charger and whose identity is the
+actual proof, not just "bytes flowed." Then confirm energization stayed
+physically correct: `EVCC`'s own charge-loop log should track `SECC`'s
+power delivery, and `EVCC_Attacker`'s should track `SECC_Attacker`'s, each
+physically paired, never swapped.
+
+**`ATTACKER_STOP_AFTER_S`** (env var on `Dev2`, since `Dev2`'s local EVCC
+is the attacker's) forcibly ends the attacker's relayed session N seconds
+after it starts — reproducing the paper's billing asymmetry (attacker's
+car charged in full and billed to the victim; victim's own car cut short,
+billed to the attacker for almost nothing) without manual timing:
+
+```bash
+ATTACKER_STOP_AFTER_S=30 docker compose --profile evexchange up --build \
+  SECC EVCC SECC_Attacker EVCC_Attacker Dev1 Dev2
+```
+
+**This is unverified** — built from the plan but not yet run end to end.
+In particular: whether `SECC` actually stops energizing promptly on the
+abrupt disconnect this produces (vs. hanging or retrying) hasn't been
+confirmed against a real run. Verify before relying on it for a
+demonstration, and update this note once confirmed.
+
+**Limitations**: one victim pair + one attacker pair at a time (the
+paper's own basic scenario, not its "more than two EVSEs" extension); no
+TLS 1.3/mutual-auth variant explored yet (plain `tls`/`notls`/`iso20`
+only); not adapted for the "[Real hardware](#real-hardware-hlc-only)"
+section below, same as the split proxy.
+
 ## Real hardware (HLC-only)
 
 For demonstrating this on physical hardware: `SECC`/`EVCC` stay as Docker
@@ -313,13 +420,17 @@ Replace `eth0`/`eth1` with your device's actual link names. `--tamper`/
 ## Repo layout
 
 ```
-docker/Dockerfile.proxytest    Builds the proxy-proxy image (iso15118 + mod_acccs + HomePlugPWN/V2GInjector)
-docker-compose.yml              SECC/EVCC + both proxy modes (default profile: single relay; --profile split: Evil_SECC/Evil_EVCC)
+evexchange_attack.pdf           The EVExchange paper (Conti et al.) this repo is named after
+docker/Dockerfile.proxytest     Builds the proxy-proxy image (iso15118 + mod_acccs + HomePlugPWN/V2GInjector)
+docker-compose.yml               SECC/EVCC + three proxy modes: default (single relay), --profile split
+                                 (Evil_SECC/Evil_EVCC), --profile evexchange (SECC_Attacker/EVCC_Attacker/Dev1/Dev2)
 proxy/proxy01.py                Single-relay MITM (SDP hijack + transparent TCP/TLS relay)
-proxy/common.py                 Decode/tamper/framing helpers shared by all three proxy entry points
+proxy/common.py                 Decode/tamper/framing/interface-discovery helpers shared by every proxy entry point
 proxy/evil_secc.py               Split-proxy fake-charger half
 proxy/evil_evcc.py               Split-proxy fake-EV half
-scripts/*_run_full.sh           SLAC then HLC, one command, per role (proxy/secc/evcc/evil_secc/evil_evcc)
+proxy/dev_relay.py               EVExchange cross-session relay (Dev1/Dev2, one shared script -- blind, no certs)
+scripts/*_run_full.sh           SLAC then HLC, one command, per role (proxy/secc/evcc/evil_secc/evil_evcc/
+                                 secc_b/evcc_attacker/dev1/dev2)
 scripts/compose_*_entry.sh      compose `command:` entrypoints (cleanup, tcpdump, run the *_run_full.sh above)
 scripts/run_full_demo.sh        Host-side orchestrator for the manual (non-compose) setup
 scripts/run_live_demo.sh        Same, streamed live/labeled to the terminal

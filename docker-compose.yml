@@ -29,6 +29,14 @@
 #   # services below) plus your own useTls:true config would be needed for
 #   # a genuinely TLS-protected -20 run -- see README for the full story.
 #
+#   # EVExchange cross-session relay (evexchange profile only -- see
+#   # README "EVExchange cross-session relay" and evexchange_attack.pdf):
+#   docker compose --profile evexchange up --build \
+#     SECC EVCC SECC_Attacker EVCC_Attacker Dev1 Dev2
+#   # ATTACKER_STOP_AFTER_S=30 (on Dev2) cuts the attacker's relayed
+#   # session short after 30s, to reproduce the paper's billing asymmetry
+#   # without manual timing -- best-effort, verify against a real run.
+#
 # Pcaps/logs land directly in ./captures on the host (bind-mounted), so no
 # docker cp step is needed afterwards either.
 #
@@ -151,6 +159,94 @@ services:
       - ./scripts/compose_evil_evcc_entry.sh:/usr/src/app/compose_evil_evcc_entry.sh:ro
       - ./captures:/captures
 
+  # --- "evexchange" profile: the actual EVExchange cross-session relay
+  # attack from the paper (Conti et al. -- see evexchange_attack.pdf),
+  # distinct from both Evil_EVSE_Evil_PEV and the split proxy above. Needs
+  # a *second* full real EV/EVSE pair (SECC_Attacker/EVCC_Attacker,
+  # alongside the existing SECC/EVCC as the victim's pair) plus two blind
+  # relay devices (Dev1/Dev2) that cross-wire the two sessions. See README
+  # "EVExchange cross-session relay". Not started by a plain
+  # `docker compose up`, nor by `--profile split` -- only via
+  # `docker compose --profile evexchange up SECC EVCC SECC_Attacker EVCC_Attacker Dev1 Dev2`.
+  # Don't run this alongside Evil_EVSE_Evil_PEV or Evil_SECC/Evil_EVCC
+  # against the same SECC/EVCC -- all of them would try to answer the same
+  # SDP/SLAC requests.
+  SECC_Attacker:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: SECC_Attacker
+    tty: true
+    stdin_open: true
+    profiles: ["evexchange"]
+    command: /usr/src/app/compose_secc_b_entry.sh
+    networks:
+      - proxy_net3
+    volumes:
+      - ./scripts/secc_b_run_full.sh:/usr/src/app/secc_b_run_full.sh:ro
+      - ./scripts/compose_secc_b_entry.sh:/usr/src/app/compose_secc_b_entry.sh:ro
+      - ./captures:/captures
+
+  EVCC_Attacker:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: EVCC_Attacker
+    tty: true
+    stdin_open: true
+    profiles: ["evexchange"]
+    command: /usr/src/app/compose_evcc_attacker_entry.sh
+    environment:
+      EVCC_MODE: ${EVCC_MODE:-tls}   # tls (default), notls, or iso20 -- same as EVCC
+    networks:
+      - proxy_net4
+    volumes:
+      - ./scripts/evcc_attacker_run_full.sh:/usr/src/app/evcc_attacker_run_full.sh:ro
+      - ./scripts/compose_evcc_attacker_entry.sh:/usr/src/app/compose_evcc_attacker_entry.sh:ro
+      - ./captures:/captures
+
+  Dev1:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: Dev1
+    tty: true
+    stdin_open: true
+    profiles: ["evexchange"]
+    command: /usr/src/app/compose_dev1_entry.sh
+    networks:        # proxy_net1 (victim's SECC) + proxy_net2 (victim's EVCC) + relay_link (Dev2 only)
+      - proxy_net1
+      - proxy_net2
+      - relay_link
+    volumes:
+      - ./proxy/dev_relay.py:/usr/src/app/iso15118/dev_relay.py:ro
+      - ./proxy/common.py:/usr/src/app/iso15118/common.py:ro
+      - ./scripts/dev1_run_full.sh:/usr/src/app/dev1_run_full.sh:ro
+      - ./scripts/compose_dev1_entry.sh:/usr/src/app/compose_dev1_entry.sh:ro
+      - ./captures:/captures
+
+  Dev2:
+    build: *proxy-build
+    image: proxy-proxy
+    container_name: Dev2
+    tty: true
+    stdin_open: true
+    profiles: ["evexchange"]
+    command: /usr/src/app/compose_dev2_entry.sh
+    environment:
+      ATTACKER_STOP_AFTER_S: ${ATTACKER_STOP_AFTER_S:-}   # optional -- see dev_relay.py;
+                             # cuts the attacker's relayed session short to
+                             # produce the paper's billing asymmetry. Read
+                             # directly by dev_relay.py (plain os.environ,
+                             # not environs), so empty/unset is safe here.
+    networks:        # proxy_net3 (attacker's SECC) + proxy_net4 (attacker's EVCC) + relay_link (Dev1 only)
+      - proxy_net3
+      - proxy_net4
+      - relay_link
+    volumes:
+      - ./proxy/dev_relay.py:/usr/src/app/iso15118/dev_relay.py:ro
+      - ./proxy/common.py:/usr/src/app/iso15118/common.py:ro
+      - ./scripts/dev2_run_full.sh:/usr/src/app/dev2_run_full.sh:ro
+      - ./scripts/compose_dev2_entry.sh:/usr/src/app/compose_dev2_entry.sh:ro
+      - ./captures:/captures
+
 networks:
   proxy_net1:
     name: proxy_net1
@@ -181,3 +277,34 @@ networks:
     ipam:
       config:
         - subnet: 172.25.0.0/24
+
+  # --- "evexchange" profile networks -- the attacker's own real EV/EVSE
+  # pair (proxy_net3/proxy_net4, mirroring proxy_net1/proxy_net2) plus the
+  # private link between Dev1 and Dev2. Subnets picked clear of what was
+  # observed in use on the dev host this session (172.17-172.25) -- same
+  # caveat as bridge_net: check `docker network ls` against your own host
+  # before creating these, that range can differ.
+  proxy_net3:
+    name: proxy_net3
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+        - subnet: 2001:db8:4::/64
+
+  proxy_net4:
+    name: proxy_net4
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+        - subnet: 2001:db8:5::/64
+
+  # Private link between Dev1 and Dev2 only -- no real EV/EVSE ever
+  # attached, same isolation property as bridge_net.
+  relay_link:
+    name: relay_link
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
