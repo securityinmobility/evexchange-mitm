@@ -22,16 +22,12 @@ cd evexchange-mitm
 docker build -f docker/Dockerfile.proxytest -t proxy-proxy .
 ```
 
-Don't confuse this with `virtual-charging-station/Proxy`'s own
-`docker compose build` — different, older Dockerfile, same resulting
-image name. Using the wrong one shows up later as "Could not find the
-file `/usr/src/app`".
-
 ## Cross-session relay
 
-Two real EV/charger pairs: `SECC`/`EVCC` on the victim's side,
-`SECC_Attacker`/`EVCC_Attacker` on the attacker's. Two relay devices sit
-inline and swap which charger each EV's session actually reaches:
+Two EV/charger pairs: `SECC`/`EVCC` on the victim's side,
+`SECC_Attacker`/`EVCC_Attacker` on the attacker's. `Dev1` sits between the
+victim's EV and the victim's charger; `Dev2` sits between the attacker's
+EV and the attacker's charger.
 
 ```
 EVCC (victim) ──proxy_net2── Dev1 ──proxy_net1── SECC (victim's charger)
@@ -41,12 +37,19 @@ EVCC (victim) ──proxy_net2── Dev1 ──proxy_net1── SECC (victim's 
 EVCC_Attacker ──proxy_net4── Dev2 ──proxy_net3── SECC_Attacker (attacker's charger)
 ```
 
-Each Dev forwards its local EV's traffic to the *other* Dev instead of
-its own local charger, so the victim's EV ends up authenticated at the
-attacker's charger and vice versa. The physical cables never move — each
-charger still only energizes whatever's plugged into it. `Dev1`/`Dev2`
-(`proxy/dev_relay.py`) are a blind byte relay: no TLS termination, no
-decoding, no certs of their own.
+Neither Dev relays its own two legs straight through. Dev1 takes what it
+hears from the victim's EV and sends it to Dev2, which forwards it to the
+attacker's charger. Dev2 does the same in reverse: what it hears from the
+attacker's EV goes to Dev1, which forwards it to the victim's charger. End
+result — the victim's EV runs its charging session against the attacker's
+charger, and the attacker's EV runs its session against the victim's
+charger, while the physical cables never move, so each charger still only
+delivers power to whatever's actually plugged into it. Since billing
+follows the session's certificate, not the cable, the victim ends up
+paying for the attacker's charge.
+
+`Dev1`/`Dev2` (`proxy/dev_relay.py`) are a blind byte relay — no TLS
+termination, no decoding, no certs of their own.
 
 ```bash
 docker compose --profile evexchange up --build \
