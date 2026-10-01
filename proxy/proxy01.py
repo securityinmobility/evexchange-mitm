@@ -17,7 +17,8 @@ import sys, os, json, socket, asyncio, datetime, argparse
 parser = argparse.ArgumentParser(description="ISO15118 Pass-through Proxy")
 parser.add_argument("--capture", action="store_true", help="Save packets to proxy_capture.log")
 parser.add_argument("--show-hex", action="store_true", help="Print packet hex previews")
-parser.add_argument("--debug", action="store_true", help="Enable EXI decoding for non-TLS")
+parser.add_argument("--debug", action="store_true",
+                     help="Enable EXI decoding for non-TLS. Same effect as DEBUG=1.")
 parser.add_argument("--tamper", action="store_true",
                      help="Tamper with EVSEMaxCurrent in ChargeParameterDiscoveryRes "
                           "(non-TLS sessions only). Same effect as TAMPER=1.")
@@ -33,7 +34,7 @@ args = parser.parse_args()
 CAPTURE_FILE = "proxy_capture.log"
 SHOW_PACKET_HEX = args.show_hex
 ENABLE_CAPTURE = args.capture
-DEBUG_EXI = args.debug
+DEBUG_EXI = args.debug or os.environ.get("DEBUG") == "1"
 
 # Only active for plaintext (non-TLS) sessions: the proxy relays TLS as an
 # opaque encrypted byte stream (see handle_client) without terminating it

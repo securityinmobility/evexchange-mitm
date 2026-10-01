@@ -30,7 +30,8 @@ parser = argparse.ArgumentParser(description="Evil_SECC -- fake-charger half of 
 parser.add_argument("--capture", action="store_true", help="Save packets to evil_secc_capture.log")
 parser.add_argument("--show-hex", action="store_true", help="Print packet hex previews")
 parser.add_argument("--debug", action="store_true",
-                     help="Print decoded EXI for EVCC->SECC messages as they're relayed")
+                     help="Print decoded EXI for EVCC->SECC messages as they're relayed. "
+                          "Same effect as DEBUG=1.")
 parser.add_argument("--evcc-iface", metavar="IFACE",
                      help="Explicit interface name facing the real EVCC, used instead of "
                           "auto-detecting by Docker subnet (proxy_net2). For real hardware.")
@@ -45,7 +46,7 @@ args = parser.parse_args()
 CAPTURE_FILE = "evil_secc_capture.log"
 SHOW_PACKET_HEX = args.show_hex
 ENABLE_CAPTURE = args.capture
-DEBUG_EXI = args.debug
+DEBUG_EXI = args.debug or os.environ.get("DEBUG") == "1"
 
 # --------------------------------------------------------------------
 # Project setup

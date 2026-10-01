@@ -14,6 +14,9 @@
 # Usage:
 #   EVCC_MODE=tls TAMPER=1 docker compose up --build   # tamper only takes
 #                                                       # effect in notls
+#   DEBUG=1 docker compose up --build   # print decoded EXI as messages are
+#                                        # relayed (off by default -- see
+#                                        # README "Content tampering")
 #   ./scripts/regen_certs.sh   # still separate: it execs create_certs.sh
 #                               # inside SECC, not a static file copy
 #
@@ -85,6 +88,7 @@ services:
     command: /usr/src/app/compose_proxy_entry.sh
     environment:
       TAMPER: ${TAMPER:-}   # 1 = tamper EVSEMaxCurrent (notls sessions only)
+      DEBUG: ${DEBUG:-}     # 1 = print decoded EXI as messages are relayed
     networks:        # dual-homed: proxy_net1 (SECC-facing) + proxy_net2 (EVCC-facing)
       - proxy_net1
       - proxy_net2
@@ -112,6 +116,7 @@ services:
     command: /usr/src/app/compose_evil_secc_entry.sh
     environment:
       ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- see EVCC_MODE=iso20 on EVCC
+      DEBUG: ${DEBUG:-}     # 1 = print decoded EVCC->SECC EXI as it's relayed
     networks:        # proxy_net2 (EVCC-facing) + bridge_net (Evil_EVCC only)
       - proxy_net2
       - bridge_net
@@ -135,6 +140,7 @@ services:
                              # and ISO 15118-20 too here, unlike the
                              # single-relay proxy's notls-only tamper.
       ENABLE_TLS_1_3: ${ENABLE_TLS_1_3:-false}   # optional -- see EVCC_MODE=iso20 on EVCC
+      DEBUG: ${DEBUG:-}     # 1 = print decoded SECC->EVCC EXI as it's relayed
     networks:        # proxy_net1 (SECC-facing) + bridge_net (Evil_SECC only)
       - proxy_net1
       - bridge_net

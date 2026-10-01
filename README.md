@@ -81,7 +81,12 @@ EVCC_MODE=tls    docker compose up --build   # (default) ISO 15118-2 TLS/PnC
 EVCC_MODE=notls  docker compose up --build   # ISO 15118-2 plaintext EIM/AC
 EVCC_MODE=iso20  docker compose up --build   # ISO 15118-20 AC
 TAMPER=1 EVCC_MODE=notls docker compose up --build   # + live tampering, see below
+DEBUG=1 EVCC_MODE=notls docker compose up --build    # + print decoded EXI as messages are relayed
 ```
+
+`--show-hex`/`--capture` (always on) only ever show raw hex — **`DEBUG=1`
+is what actually prints decoded EXI content**, and it's off by default, so
+without it you're only ever seeing hex, not translated message content.
 
 **The split proxy** uses the same image/modes, just a different profile —
 name the services explicitly so you don't also start the single relay
@@ -247,6 +252,7 @@ behaves exactly as before. Run it with:
 ```bash
 docker compose --profile split up --build SECC EVCC Evil_SECC Evil_EVCC
 EVCC_MODE=iso20 docker compose --profile split up --build SECC EVCC Evil_SECC Evil_EVCC   # the mode that actually exercises the split's reason for existing
+DEBUG=1 EVCC_MODE=tls docker compose --profile split up --build SECC EVCC Evil_SECC Evil_EVCC   # decoded EXI, even under real TLS
 ```
 
 Don't run this alongside `Evil_EVSE_Evil_PEV` against the same `SECC`/

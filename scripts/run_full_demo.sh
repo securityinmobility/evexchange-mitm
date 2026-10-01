@@ -5,6 +5,9 @@
 #
 # Usage:
 #   ./run_full_demo.sh [tls|notls|iso20] [tamper]
+#   DEBUG=1 ./run_full_demo.sh ...   -- (host env var, not a positional arg)
+#                       print decoded EXI as messages are relayed. Off by
+#                       default -- see README "Content tampering".
 #   tls   (default) -- EVCC negotiates a real ISO 15118-2 TLS/PnC session
 #                       with a full certificate chain.
 #   notls           -- EVCC negotiates a plaintext ISO 15118-2 EIM/AC
@@ -57,6 +60,9 @@ if [ "$TAMPER_ARG" = "tamper" ]; then
         echo "      -20 uses a differently-shaped ACChargeParameterDiscoveryRes, so" >&2
         echo "      expect no [TAMPER] line even though iso20 runs plaintext here." >&2
     fi
+fi
+if [ "${DEBUG:-}" = "1" ]; then
+    PROXY_ENV_ARGS+=(-e DEBUG=1)
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"

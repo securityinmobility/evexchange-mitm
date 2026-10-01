@@ -32,7 +32,8 @@ parser = argparse.ArgumentParser(description="Evil_EVCC -- fake-EV half of the s
 parser.add_argument("--capture", action="store_true", help="Save packets to evil_evcc_capture.log")
 parser.add_argument("--show-hex", action="store_true", help="Print packet hex previews")
 parser.add_argument("--debug", action="store_true",
-                     help="Print decoded EXI for SECC->EVCC messages as they're relayed")
+                     help="Print decoded EXI for SECC->EVCC messages as they're relayed. "
+                          "Same effect as DEBUG=1.")
 parser.add_argument("--tamper", action="store_true",
                      help="Tamper with EVSEMaxCurrent in ChargeParameterDiscoveryRes "
                           "(ISO 15118-2 AC sessions only; works in TLS/PnC mode too, unlike "
@@ -49,7 +50,7 @@ args = parser.parse_args()
 CAPTURE_FILE = "evil_evcc_capture.log"
 SHOW_PACKET_HEX = args.show_hex
 ENABLE_CAPTURE = args.capture
-DEBUG_EXI = args.debug
+DEBUG_EXI = args.debug or os.environ.get("DEBUG") == "1"
 TAMPER_ENABLED = args.tamper or os.environ.get("TAMPER") == "1"
 TAMPER_NEW_CURRENT_A = int(os.environ.get("TAMPER_CURRENT_A", "63"))
 
